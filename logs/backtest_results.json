@@ -1,0 +1,74 @@
+[
+  {
+    "total_ret_%": -2.65,
+    "max_dd_%": 4.88,
+    "trades": 34,
+    "sharpe": -4.26,
+    "sortino": -4.33,
+    "calmar": -0.54,
+    "composite_score": -3.17,
+    "final_portfolio_$": 97352.08,
+    "period": "Pre-Comp (Oct 1-4)",
+    "config": "4-Hour Rebalance + BTC Filter"
+  },
+  {
+    "total_ret_%": -5.57,
+    "max_dd_%": 6.37,
+    "trades": 80,
+    "sharpe": -6.14,
+    "sortino": -8.82,
+    "calmar": -0.87,
+    "composite_score": -5.63,
+    "final_portfolio_$": 94354.67,
+    "period": "Pre-Comp (Oct 1-4)",
+    "config": "1-Hour Rebalance + BTC Filter"
+  },
+  {
+    "total_ret_%": -0.03,
+    "max_dd_%": 0.89,
+    "trades": 10,
+    "sharpe": 4.95,
+    "sortino": 10.12,
+    "calmar": -0.03,
+    "composite_score": 5.52,
+    "final_portfolio_$": 99971.89,
+    "period": "Comp-Live (Oct 5-6)",
+    "config": "4-Hour Rebalance + BTC Filter"
+  },
+  {
+    "total_ret_%": -3.65,
+    "max_dd_%": 4.63,
+    "trades": 28,
+    "sharpe": -16.72,
+    "sortino": -14.62,
+    "calmar": -0.79,
+    "composite_score": -11.1,
+    "final_portfolio_$": 96275.64,
+    "period": "Comp-Live (Oct 5-6)",
+    "config": "1-Hour Rebalance + BTC Filter"
+  },
+  {
+    "total_ret_%": -2.95,
+    "max_dd_%": 5.71,
+    "trades": 52,
+    "sharpe": -1.96,
+    "sortino": -2.1,
+    "calmar": -0.52,
+    "composite_score": -1.58,
+    "final_portfolio_$": 97048.96,
+    "period": "Full (Oct 1-6)",
+    "config": "4-Hour Rebalance + BTC Filter"
+  },
+  {
+    "total_ret_%": 2.05,
+    "max_dd_%": 3.91,
+    "trades": 54,
+    "sharpe": 7.15,
+    "sortino": 9.91,
+    "calmar": 0.52,
+    "composite_score": 6.26,
+    "final_portfolio_$": 102046.81,
+    "period": "Full (Oct 1-6)",
+    "config": "Unhedged (No Stop Loss, No BTC Filter)"
+  }
+]

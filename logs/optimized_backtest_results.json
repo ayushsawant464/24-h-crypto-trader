@@ -1,0 +1,50 @@
+[
+  {
+    "total_ret_%": -2.94,
+    "max_dd_%": 5.17,
+    "trades": 32,
+    "sharpe": -5.18,
+    "sortino": -5.57,
+    "calmar": -0.57,
+    "composite_score": -3.95,
+    "final_portfolio_$": 97056.04,
+    "period": "Pre-Comp (Oct 1-4)",
+    "config": "4-Hour Rebalance (SL 3.5%)"
+  },
+  {
+    "total_ret_%": 0.02,
+    "max_dd_%": 0.89,
+    "trades": 10,
+    "sharpe": 5.68,
+    "sortino": 12.67,
+    "calmar": 0.02,
+    "composite_score": 6.78,
+    "final_portfolio_$": 100022.35,
+    "period": "Comp-Live (Oct 5-6)",
+    "config": "4-Hour Rebalance (SL 3.5%)"
+  },
+  {
+    "total_ret_%": -3.2,
+    "max_dd_%": 6.0,
+    "trades": 50,
+    "sharpe": -2.6,
+    "sortino": -2.9,
+    "calmar": -0.53,
+    "composite_score": -2.1,
+    "final_portfolio_$": 96802.67,
+    "period": "Full (Oct 1-6)",
+    "config": "4-Hour Rebalance (SL 3.5%)"
+  },
+  {
+    "total_ret_%": -3.2,
+    "max_dd_%": 6.0,
+    "trades": 50,
+    "sharpe": -2.6,
+    "sortino": -2.9,
+    "calmar": -0.53,
+    "composite_score": -2.1,
+    "final_portfolio_$": 96802.67,
+    "period": "Full (Oct 1-6)",
+    "config": "4-Hour Rebalance (SL 5.0%)"
+  }
+]

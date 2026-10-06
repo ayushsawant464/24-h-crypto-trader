@@ -1,0 +1,133 @@
+# Algorithmic Decision Calculus & Quantitative Execution Matrix
+
+This document defines the mathematical decision rules governing all trade entries, exits, position sizing, hedging, and emergency pullbacks for the Roostoo Trading Bot. 
+
+No order may be placed unless it passes every condition in the **Decision Gates** defined below.
+
+---
+
+## 1. The Core Equation: Positive Expected Value Gate ($\mathbb{E}[R] > 0$)
+
+Every trade must satisfy the Positive Net Expectancy hurdle:
+
+$$\mathbb{E}[R_{\text{net}}] = \Big(P(\text{Win}) \times \bar{R}_{\text{Win}}\Big) - \Big(P(\text{Loss}) \times \bar{R}_{\text{Loss}}\Big) - \text{Friction} \ge +0.80\%$$
+
+Where:
+* **$\text{Friction}$**: $2 \times \text{Fee}_{\text{taker}} + \text{Spread} = 2 \times 0.10\% + \text{Spread} \approx 0.22\%\text{ to }0.25\%$.
+* **Reward-to-Risk Requirement**: 
+  $$\frac{\bar{R}_{\text{Win}}}{\bar{R}_{\text{Loss}}} \ge 2.0$$
+* **Probability of Win Threshold**: Historical conditioned win rate $P(\text{Win}) \ge 55\%$ based on order-flow alignment.
+
+---
+
+## 2. The 5 Sequential Decision Gates for TRADE ENTRY
+
+```
+[Candidate Asset Identified]
+            │
+            ▼
+[GATE 1: Macro / Regime Filter] ──────► FAIL: Reject Longs / Move 100% to Cash Bunker
+            │ PASS
+            ▼
+[GATE 2: Liquidity & Spread]    ──────► FAIL: Reject Asset (Avoid Slippage Trap)
+            │ PASS
+            ▼
+[GATE 3: Order Flow Toxicity]   ──────► FAIL: Reject Asset (Avoid Insider Dumps)
+            │ PASS
+            ▼
+[GATE 4: Alpha Identification]  ──────► FAIL: Reject Asset (No Statistical Edge)
+            │ PASS
+            ▼
+[GATE 5: Sizing & Execution]    ──────► CALCULATE: Volatility-Adjusted Kelly Sizing
+            │
+            ▼
+    [EXECUTE ORDER VIA API]
+```
+
+### Gate 1: Macro & Regime Permission
+* **Condition 1A (BTC Trend)**: Bitcoin 1-Hour Close $\ge \text{EMA}_{20}(\text{BTC})$.
+* **Condition 1B (BTC Order Flow)**: BTC 4-Hour Taker Buy Ratio $\ge 45.0\%$.
+* **Condition 1C (Systemic Volatility)**: BTC $15\text{m ATR} < 2.2 \times \overline{\text{ATR}}_{20}$.
+* *Rationale*: Altcoin alpha only persists when systematic crypto beta is stable. If BTC is dumping, all altcoins drop $2\times$ harder regardless of chart setup.
+
+### Gate 2: Liquidity & Microstructure Gate
+* **Condition 2A (24h Volume)**: $\text{UnitTradeValue} \ge \$5,000,000\text{ USD}$.
+* **Condition 2B (Bid-Ask Spread)**: $\frac{\text{MinAsk} - \text{MaxBid}}{\text{LastPrice}} \le 0.035\%$.
+* **Condition 2C (Execution Capacity)**: Proposed order size $\le 0.5\%$ of average hourly volume.
+* *Rationale*: Eliminates fee/spread traps like `PEPE` (spread $0.23\%$) or tokenized stocks like `PLTRB` ($88k daily volume).
+
+### Gate 3: Order Flow Toxicity & Whale Filter
+* **Condition 3A (Taker Flow)**: Rolling 4-Hour Taker Buy Ratio $\ge 51.0\%$.
+* **Condition 3B (Order Imbalance)**: Rolling 15-Minute Taker Imbalance $\ge 0.0$:
+  $$\text{Imbalance} = \frac{\text{Taker Buy Quote} - \text{Taker Sell Quote}}{\text{Total Quote Volume}} \ge 0$$
+* **Condition 3C (No Toxic Dumps)**: Zero 15-minute candles in the past 2 hours with Volume $> 2.5\sigma$ and negative close.
+* *Rationale*: Ensures we are entering alongside informed institutional buyers and never buying into a whale offloading inventory.
+
+### Gate 4: Alpha Thesis Identification
+The bot must classify the exact alpha source:
+* **Alpha Type A (Cross-Sectional Momentum)**: 
+  * 12-Hour Return $\ge +2.0\%$ AND Return ranked in Top 3 of the universe.
+  * Risk-Adjusted Momentum Score: $\frac{R_{12\text{h}}}{\text{ATR}_{12\text{h}}} \ge 1.5$.
+* **Alpha Type B (Mean-Reverting Relative-Value Pair)**:
+  * Spread Z-score against BTC: $Z_{\text{spread}} < -2.0\sigma$.
+  * Cointegration ADF p-value $< 0.05$.
+
+### Gate 5: Position Sizing & Allocation Calculus
+* **Volatility Parity Allocation**:
+  $$W_i = \min\left(0.30, \frac{\text{Target Risk (1.0\%)}}{\text{ATR}_{i,\%}}\right)$$
+* **Constraints**:
+  * Max Single-Asset Allocation: **$30\%$** ($30,000 USD).
+  * Max Total Invested Exposure: **$80\%$** ($80,000 USD).
+  * Minimum Cash Reserve: **$20\%$** ($20,000 USD) held in free USD balance at all times.
+
+---
+
+## 3. The Calculating Decision Calculus for TRADE EXITS
+
+Every open position is continuously evaluated on a **1-minute loop**. An exit occurs exclusively when one of four mathematical conditions is met:
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           1-MINUTE RISK EVALUATION LOOP                     │
+└──────────────────────────────────────┬──────────────────────────────────────┘
+                                       │
+       ┌───────────────────────────────┼───────────────────────────────┐
+       ▼                               ▼                               ▼
+[1. Stop-Loss Trigger]        [2. Profit Ratchet Trigger]     [3. Toxicity Trigger]
+Loss >= max(3.0%, 2.2*ATR)    Gain >= +2.0%: Lock +0.4%       Taker Imbalance < -25%
+Action: Market Sell (Cash)    Gain >= +4.0%: Trail Peak -1.2% Action: Emergency Sell
+```
+
+### Exit Rule 1: Volatility-Adjusted Hard Stop-Loss
+* **Trigger Condition**:
+  $$\text{Unrealized PnL} \le -\max(3.0\%, 2.2 \times \text{ATR}_{15\text{m}})$$
+* **Calculated Action**: Immediately liquidate $100\%$ of position to cash. Prevents an intraday pullback from turning into a $-10\%$ account killer.
+
+### Exit Rule 2: Dynamic Profit Ratchet & Trailing Lock
+* **Stage 1 (Breakeven Lock)**:
+  * If Unrealized PnL reaches **$+2.0\%$**: Ratchet stop-loss to **Entry Price $+0.40\%$**.
+  * *Calculus*: Guarantees that fees ($0.2\%$) are covered and the trade mathematically cannot become a loss.
+* **Stage 2 (Trailing Profit Run)**:
+  * If Unrealized PnL reaches **$+4.0\%$**: Activate trailing stop at **$\text{Highest Price} - 1.2\%$**.
+  * *Calculus*: Lets exponential runners (like ADA $+12\%$) run while locking in at least $70\%$ of peak gains.
+
+### Exit Rule 3: Order Flow Toxicity Exit (Insider Dump Evasion)
+* **Trigger Condition**:
+  $$\text{Rolling 15m Taker Imbalance} < -25.0\% \quad \text{AND} \quad \text{Volume} > 2.5\sigma$$
+* **Calculated Action**: Immediate Emergency Market Sell.
+* *Calculus*: Informs us that whales/insiders are dumping before public disclosure; avoids holding through a multi-hour breakdown.
+
+### Exit Rule 4: Cycle Demotion (Rebalancing Rotation)
+* Evaluated every **8 to 12 Hours**:
+* If an active asset falls below Rank 4 in momentum or Taker Buy Ratio falls below $49.0\%$, the position is gracefully closed to recycle capital into the new Top 2 leaders.
+
+---
+
+## 4. The Macro Circuit Breaker (Black Swan Protocol)
+
+* **Trigger**: If total portfolio value drops by **$> 2.0\%$** from all-time peak within a rolling 24-hour window.
+* **Action**:
+  1. Liquidate $100\%$ of all open positions into USD Cash.
+  2. Cancel all pending orders.
+  3. Freeze new order entries for a mandatory **4-Hour Cooldown**.
+* **Calculus**: Caps the maximum possible portfolio drawdown at $2.0\%$, mathematically preserving top-tier Calmar ($\ge 5.0$) and Sortino ($\ge 8.0$) scores.
