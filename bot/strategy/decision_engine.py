@@ -93,49 +93,72 @@ class DecisionEngine(BaseStrategy):
             reverse=True
         )
 
-        # Select Top 2 to Top 3 Assets
-        selected = candidates[:3]
+        # --- Determine Market Regime & Core-Satellite Allocation ---
+        # Look at BTC 12h return from snapshot if available
+        btc_metric = snapshot.assets.get("BTCUSDT")
+        btc_12h = btc_metric.return_12h_pct if btc_metric else 0.0
 
-        if not selected:
-            logger.info("No candidate assets passed all 5 gates. Holding 100% USD Cash.")
-            return StrategyDecision(
-                target_weights={"USD": 1.0},
-                regime="MARKET_NEUTRAL_CASH",
-                rationales={"USD": "No asset passed the positive expectancy threshold. Holding 100% Cash."},
-                expected_returns={"USD": 0.0}
-            )
+        if btc_12h > 1.0 and snapshot.btc_taker_buy_pct >= 48.0:
+            regime = "BULL_EXPANSION"
+            anchor_budget = settings.BULL_ANCHOR_WEIGHT        # 20%
+            satellite_budget = settings.BULL_SATELLITE_WEIGHT  # 60%
+        elif abs(btc_12h) <= 1.0:
+            regime = "SIDEWAYS_STABILITY"
+            anchor_budget = settings.SIDEWAYS_ANCHOR_WEIGHT    # 60%
+            satellite_budget = settings.SIDEWAYS_SATELLITE_WEIGHT  # 20%
+        else:
+            regime = "BASELINE_BALANCED"
+            anchor_budget = settings.BASELINE_ANCHOR_WEIGHT    # 40%
+            satellite_budget = settings.BASELINE_SATELLITE_WEIGHT  # 40%
 
-        # --- GATE 5: Volatility-Parity Position Sizing ---
-        total_allocated = 0.0
-        for m in selected:
-            ev = self.calculate_expected_value(m)
-            # Target 1.0% risk / 15m ATR
-            raw_weight = 1.0 / max(m.atr_15m_pct, 0.5)
-            # Cap at 30% per asset
-            weight = min(settings.MAX_ALLOCATION_PER_ASSET, max(0.15, raw_weight * 0.20))
-            
-            # Ensure total doesn't exceed 80% (preserving 20% cash)
-            if total_allocated + weight > settings.MAX_TOTAL_INVESTED:
-                weight = max(0.0, settings.MAX_TOTAL_INVESTED - total_allocated)
+        # --- 1. Anchor Allocation (Mega-Cap Stability: BTC or ETH) ---
+        eth_metric = snapshot.assets.get("ETHUSDT")
+        anchor_pair = "BTC/USD"
+        # If ETH has superior risk-adjusted momentum and taker buy, use ETH as anchor
+        if eth_metric and btc_metric and eth_metric.return_12h_pct > btc_metric.return_12h_pct and eth_metric.taker_buy_4h_pct > 50.0:
+            anchor_pair = "ETH/USD"
 
-            if weight >= 0.10:
-                target_weights[m.roostoo_pair] = round(weight, 3)
-                total_allocated += weight
-                rationales[m.roostoo_pair] = (
-                    f"Passed all 5 gates | 12h Ret: {m.return_12h_pct:.2f}% | "
-                    f"Taker Buy: {m.taker_buy_4h_pct:.1f}% | Alpha: {m.residual_alpha_pct:.2f}% | E[R]: +{ev:.2f}%"
-                )
-                expected_returns[m.roostoo_pair] = ev
+        target_weights[anchor_pair] = round(anchor_budget, 3)
+        rationales[anchor_pair] = f"Anchor Core ({anchor_budget*100:.0f}%) | Regime: {regime} | Mega-cap stability & market presence."
+        expected_returns[anchor_pair] = 0.50
 
-        # Remaining capital in USD Cash
-        cash_weight = max(settings.MIN_CASH_BUFFER, 1.0 - total_allocated)
-        target_weights["USD"] = round(cash_weight, 3)
-        rationales["USD"] = f"Preserving {cash_weight*100:.1f}% cash buffer to guarantee zero drawdown on reserves."
+        # --- 2. Satellite Allocation (Diversified Lower-Price / High-Beta Assets) ---
+        # Sort candidates: preference to lower price / high beta with strong order flow
+        candidates.sort(
+            key=lambda x: (x.residual_alpha_pct + (x.taker_buy_4h_pct - 50.0) * 0.5) / max(x.last_price ** 0.1, 1.0),
+            reverse=True
+        )
+
+        selected_satellites = candidates[:3]
+        if selected_satellites:
+            # Weighted diversification across satellite basket
+            total_inv_vol = sum(1.0 / max(m.atr_15m_pct, 0.4) for m in selected_satellites)
+            for m in selected_satellites:
+                ev = self.calculate_expected_value(m)
+                weight_fraction = (1.0 / max(m.atr_15m_pct, 0.4)) / max(total_inv_vol, 1e-6)
+                sat_weight = min(0.30, round(satellite_budget * weight_fraction, 3))
+                
+                if sat_weight >= 0.05:
+                    target_weights[m.roostoo_pair] = sat_weight
+                    rationales[m.roostoo_pair] = (
+                        f"Satellite Basket ({sat_weight*100:.1f}%) | LastPrice: ${m.last_price:.4f} | "
+                        f"12h Ret: {m.return_12h_pct:+.2f}% | Alpha: {m.residual_alpha_pct:+.2f}% | TakerBuy: {m.taker_buy_4h_pct:.1f}%"
+                    )
+                    expected_returns[m.roostoo_pair] = ev
+        else:
+            # If no satellite passed, shift satellite budget into Anchor / Cash
+            target_weights[anchor_pair] = min(0.70, round(target_weights[anchor_pair] + (satellite_budget * 0.5), 3))
+
+        # --- 3. Cash Buffer Allocation ---
+        allocated_so_far = sum(w for k, w in target_weights.items() if k != "USD")
+        cash_weight = max(settings.MIN_CASH_BUFFER, round(1.0 - allocated_so_far, 3))
+        target_weights["USD"] = cash_weight
+        rationales["USD"] = f"Liquid Cash Buffer ({cash_weight*100:.1f}%) preserving capital and absorbing trading fees."
         expected_returns["USD"] = 0.0
 
         return StrategyDecision(
             target_weights=target_weights,
-            regime="BULL_MOMENTUM_ALPHA",
+            regime=regime,
             rationales=rationales,
             expected_returns=expected_returns
         )

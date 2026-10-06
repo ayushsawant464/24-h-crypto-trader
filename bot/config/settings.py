@@ -25,10 +25,18 @@ class Settings:
     MIN_TAKER_BUY_PCT: float = 51.0             # Gate 3: Minimum informed taker buy %
     MIN_EXPECTED_NET_RETURN_PCT: float = 0.80   # Core Hurdle: Positive Net Expectancy
     
-    # Portfolio Allocation Rules
-    MAX_ALLOCATION_PER_ASSET: float = 0.30      # Max 30% per asset
+    # Portfolio Allocation Rules (Core-Satellite Architecture)
+    MAX_ALLOCATION_PER_ASSET: float = 0.40      # Max 40% for anchor / 30% for satellite
     MAX_TOTAL_INVESTED: float = 0.80            # Max 80% total exposure
     MIN_CASH_BUFFER: float = 0.20               # Keep 20% in USD Cash
+    
+    # Regime Weights: Anchor (BTC/ETH) : Satellite (Small-Caps) : Cash
+    BASELINE_ANCHOR_WEIGHT: float = 0.40        # 40% Core
+    BASELINE_SATELLITE_WEIGHT: float = 0.40     # 40% Small-Cap Basket
+    BULL_ANCHOR_WEIGHT: float = 0.20            # 20% Core in Bull
+    BULL_SATELLITE_WEIGHT: float = 0.60         # 60% Small-Cap Basket in Bull
+    SIDEWAYS_ANCHOR_WEIGHT: float = 0.60        # 60% Core in Sideways
+    SIDEWAYS_SATELLITE_WEIGHT: float = 0.20     # 20% Small-Cap Basket in Sideways
     
     # Risk Management & Stop Limits
     HARD_STOP_LOSS_PCT: float = 3.5             # 3.5% initial stop-loss
