@@ -35,81 +35,105 @@ class DecisionEngine(BaseStrategy):
         rationales: Dict[str, str] = {}
         expected_returns: Dict[str, float] = {}
 
-        # --- GATE 1: Macro & Regime Permission ---
-        macro_passed = (
-            snapshot.btc_above_ema20 and
-            snapshot.btc_taker_buy_pct >= 45.0 and
-            snapshot.btc_atr_normal
+        # --- COMPOSITE MULTI-FACTOR REGIME CLASSIFIER ---
+        btc_metric = snapshot.assets.get("BTCUSDT")
+        btc_12h = btc_metric.return_12h_pct if btc_metric else 0.0
+
+        # Factor 1: Trend Alignment (BTC vs EMA20)
+        trend_bullish = snapshot.btc_above_ema20
+
+        # Factor 2: Order Flow Conviction (Taker Buy Ratio)
+        orderflow_healthy = snapshot.btc_taker_buy_pct >= 47.0
+
+        # Factor 3: Volatility Environment (Normal ATR vs Liquidation Cascade)
+        volatility_stable = snapshot.btc_atr_normal
+
+        # Factor 4: Momentum Velocity (12h Return)
+        momentum_positive = btc_12h > 0.8
+
+        # --- REGIME DETERMINATION ---
+        if not trend_bullish or not volatility_stable or btc_12h < -1.5 or snapshot.btc_taker_buy_pct < 45.0:
+            regime = "BEAR_CONTRACTION"
+        elif trend_bullish and momentum_positive and orderflow_healthy:
+            regime = "BULL_EXPANSION"
+        else:
+            regime = "SIDEWAYS_STABILITY"
+
+        logger.info(
+            f"[REGIME CLASSIFIER] Classified Market as: {regime} | "
+            f"BTC>EMA20: {trend_bullish} | 12h Ret: {btc_12h:+.2f}% | "
+            f"TakerBuy: {snapshot.btc_taker_buy_pct:.1f}% | VolStable: {volatility_stable}"
         )
 
-        if not macro_passed:
-            logger.warning(
-                f"[GATE 1 FAILED] BTC below EMA20 or high volatility cascade. "
-                f"Activating Cash Bunker / Protective Hedge."
-            )
-            # Allocate 100% to USD Cash (or small BTC short hedge if allowed)
+        # =========================================================================
+        # REGIME A: BEAR CONTRACTION (Capital Defense, Gold Fortress, Short Hedge)
+        # =========================================================================
+        if regime == "BEAR_CONTRACTION":
+            target_weights["USD"] = settings.BEAR_CASH_WEIGHT  # 70% Free Cash
+            rationales["USD"] = "Bear Market: 70% capital protected in USD Cash Bunker to guarantee zero drawdown."
+            expected_returns["USD"] = 0.0
+
+            # Safe-Haven Gold allocation (PAXG/USD)
+            paxg_pair = "PAXG/USD"
+            target_weights[paxg_pair] = settings.BEAR_GOLD_WEIGHT  # 20% Gold
+            rationales[paxg_pair] = "Bear Market Safe-Haven: 20% allocation to PAXG (physical gold peg) decoupled from crypto sell-offs."
+            expected_returns[paxg_pair] = 0.20
+
+            # Optional Short BTC Hedge (captures alpha from crypto decline)
+            if settings.ENABLE_SHORTING:
+                target_weights["BTC/USD"] = -settings.BEAR_SHORT_HEDGE_WEIGHT  # -10% Short Hedge
+                rationales["BTC/USD"] = "Bear Market Hedge: 10% 1x Short BTC position via /v6/short_open to generate positive return during market dumps."
+                expected_returns["BTC/USD"] = 1.50
+            else:
+                target_weights["USD"] += settings.BEAR_SHORT_HEDGE_WEIGHT
+
             return StrategyDecision(
-                target_weights={"USD": 1.0},
-                regime="CASH_BUNKER",
-                rationales={"USD": "Macro regime failure: BTC below EMA20. Capital parked in Cash Bunker."},
-                expected_returns={"USD": 0.0}
+                target_weights=target_weights,
+                regime=regime,
+                rationales=rationales,
+                expected_returns=expected_returns
             )
 
-        # --- Screen Assets through Gates 2, 3, and 4 ---
+        # =========================================================================
+        # REGIME B & C: BULL EXPANSION & SIDEWAYS STABILITY (Core-Satellite Engine)
+        # =========================================================================
+        # Screen candidates for satellite basket through Gates 2, 3, and 4
         candidates: List[AssetMetrics] = []
         for sym, m in snapshot.assets.items():
-            if sym == "BTCUSDT":
-                continue  # BTC is our macro benchmark, not a momentum alt
+            if sym in ("BTCUSDT", "PAXGUSDT"):
+                continue  # Benchmark and Gold handled separately
 
-            # GATE 2: Liquidity & Spread
+            # Gate 2: Liquidity & Spread
             if not m.is_liquid:
                 continue
 
-            # GATE 3: Order Flow Toxicity & Whale Filter
+            # Gate 3: Order Flow Toxicity & Whale Filter
             if m.taker_buy_4h_pct < settings.MIN_TAKER_BUY_PCT:
                 continue
             if m.taker_imbalance_15m < 0.0:
                 continue
             if m.vol_zscore_15m > 2.5 and m.return_15m_pct < 0.0:
-                # Toxic insider/whale selling spike detected
                 continue
 
-            # GATE 4: Alpha Identification (Momentum & Residual Alpha)
-            if m.return_12h_pct < 1.5:
+            # Gate 4: Alpha Identification (Momentum & Residual Alpha)
+            if m.return_12h_pct < 1.0:
                 continue
             if m.residual_alpha_pct <= 0.0:
                 continue
 
-            # Compute Expected Net Value
+            # Positive Expected Value Hurdle
             ev = self.calculate_expected_value(m)
             if ev < self.min_expected_return:
                 continue
 
             candidates.append(m)
 
-        # Sort candidates by Residual Alpha and Momentum
-        candidates.sort(
-            key=lambda x: (x.residual_alpha_pct + (x.taker_buy_4h_pct - 50.0) * 0.5),
-            reverse=True
-        )
-
-        # --- Determine Market Regime & Core-Satellite Allocation ---
-        # Look at BTC 12h return from snapshot if available
-        btc_metric = snapshot.assets.get("BTCUSDT")
-        btc_12h = btc_metric.return_12h_pct if btc_metric else 0.0
-
-        if btc_12h > 1.0 and snapshot.btc_taker_buy_pct >= 48.0:
-            regime = "BULL_EXPANSION"
-            anchor_budget = settings.BULL_ANCHOR_WEIGHT        # 20%
-            satellite_budget = settings.BULL_SATELLITE_WEIGHT  # 60%
-        elif abs(btc_12h) <= 1.0:
-            regime = "SIDEWAYS_STABILITY"
-            anchor_budget = settings.SIDEWAYS_ANCHOR_WEIGHT    # 60%
-            satellite_budget = settings.SIDEWAYS_SATELLITE_WEIGHT  # 20%
-        else:
-            regime = "BASELINE_BALANCED"
-            anchor_budget = settings.BASELINE_ANCHOR_WEIGHT    # 40%
-            satellite_budget = settings.BASELINE_SATELLITE_WEIGHT  # 40%
+        if regime == "BULL_EXPANSION":
+            anchor_budget = settings.BULL_ANCHOR_WEIGHT        # 20% Core
+            satellite_budget = settings.BULL_SATELLITE_WEIGHT  # 60% Small-Cap Basket
+        else: # SIDEWAYS_STABILITY
+            anchor_budget = settings.SIDEWAYS_ANCHOR_WEIGHT    # 60% Core
+            satellite_budget = settings.SIDEWAYS_SATELLITE_WEIGHT  # 20% Small-Cap Basket
 
         # --- 1. Anchor Allocation (Mega-Cap Stability: BTC or ETH) ---
         eth_metric = snapshot.assets.get("ETHUSDT")

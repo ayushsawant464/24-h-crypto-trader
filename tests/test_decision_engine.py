@@ -3,14 +3,14 @@ from bot.strategy.decision_engine import DecisionEngine
 from bot.data.market_feed import MarketSnapshot, AssetMetrics
 
 class TestDecisionEngine(unittest.TestCase):
-    def test_decision_engine_macro_filter(self):
+    def test_decision_engine_bear_contraction(self):
         """
-        Validates that when BTC drops below EMA20, Gate 1 halts long allocations
-        and moves 100% to Cash Bunker (minimum 0 assets in worst condition).
+        Validates that when BTC drops below EMA20 or experiences heavy selling,
+        the Bear Contraction regime triggers: 70% USD Cash, 20% PAXG Gold, and -10% Short BTC Hedge.
         """
         engine = DecisionEngine()
         
-        # Snapshot where BTC is below EMA20
+        # Snapshot where BTC is below EMA20 and has weak taker buy
         snapshot = MarketSnapshot(
             timestamp=1000000.0,
             btc_above_ema20=False,
@@ -21,8 +21,10 @@ class TestDecisionEngine(unittest.TestCase):
         )
 
         decision = engine.evaluate(snapshot, portfolio_state={})
-        self.assertEqual(decision.regime, "CASH_BUNKER")
-        self.assertEqual(decision.target_weights, {"USD": 1.0})
+        self.assertEqual(decision.regime, "BEAR_CONTRACTION")
+        self.assertEqual(decision.target_weights["USD"], 0.70)
+        self.assertEqual(decision.target_weights["PAXG/USD"], 0.20)
+        self.assertEqual(decision.target_weights["BTC/USD"], -0.10)
 
     def test_decision_engine_core_satellite_sideways(self):
         """

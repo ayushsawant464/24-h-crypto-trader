@@ -38,6 +38,12 @@ class Settings:
     SIDEWAYS_ANCHOR_WEIGHT: float = 0.60        # 60% Core in Sideways
     SIDEWAYS_SATELLITE_WEIGHT: float = 0.20     # 20% Small-Cap Basket in Sideways
     
+    # Bear Market Regime Weights (Defense & Capital Preservation)
+    BEAR_CASH_WEIGHT: float = 0.70              # 70% Free USD Cash Bunker
+    BEAR_GOLD_WEIGHT: float = 0.20              # 20% PAXG/USD (Safe-Haven Gold)
+    BEAR_SHORT_HEDGE_WEIGHT: float = 0.10       # 10% Short BTC Hedge (Optional alpha)
+    ENABLE_SHORTING: bool = True
+    
     # Risk Management & Stop Limits
     HARD_STOP_LOSS_PCT: float = 3.5             # 3.5% initial stop-loss
     PROFIT_RATCHET_TRIGGER_PCT: float = 2.0     # When profit >= +2.0%
