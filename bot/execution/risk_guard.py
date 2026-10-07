@@ -15,14 +15,15 @@ class PositionTracker:
     effective_stop_price: float
     is_ratcheted: bool
     is_trailing: bool
+    side: str = "LONG"
 
 class RiskGuard:
     """
     Real-time 1-minute risk daemon enforcing:
-    - Volatility-Adjusted Hard Stop-Loss
-    - Breakeven Profit Ratchet (+2.0% -> +0.4%)
+    - Volatility-Adjusted Hard Stop-Loss (Long & Short)
+    - Breakeven Profit Ratchet (+2.0% -> +0.4% fees covered)
     - Trailing Profit Lock (+4.0% -> Peak - 1.2%)
-    - Order Flow Toxicity Emergency Exit
+    - Order Flow Toxicity Emergency Exit / Squeeze Avoidance
     - Portfolio Circuit Breaker (2.0% Drawdown -> 100% Cash)
     """
     def __init__(self, roostoo_client: RoostooClient):
@@ -34,7 +35,7 @@ class RiskGuard:
 
     def update_positions_from_wallet(self, tickers: Dict[str, Any], exchange_info: Dict[str, Any]):
         """
-        Synchronizes active position tracking with Roostoo wallet state.
+        Synchronizes active position tracking with Roostoo wallet and short positions.
         """
         balance_resp = self.roostoo.get_balance()
         wallet = balance_resp.get("Wallet", {})
@@ -47,11 +48,11 @@ class RiskGuard:
             pair = f"{coin}/USD"
             price = tickers.get(pair, {}).get("LastPrice", 0.0)
 
-            # If position is non-trivial (> $25 value)
+            # If spot position is non-trivial (> $25 value)
             if tot_qty * price > 25.0:
                 current_pairs.add(pair)
                 if pair not in self.active_positions:
-                    # New position detected
+                    # New spot long position detected
                     stop_p = price * (1.0 - settings.HARD_STOP_LOSS_PCT / 100.0)
                     self.active_positions[pair] = PositionTracker(
                         pair=pair,
@@ -60,15 +61,52 @@ class RiskGuard:
                         quantity=tot_qty,
                         effective_stop_price=stop_p,
                         is_ratcheted=False,
-                        is_trailing=False
+                        is_trailing=False,
+                        side="LONG"
                     )
-                    logger.info(f"[RISK GUARD] Tracking new position: {pair} @ ${price:,.4f} | Stop: ${stop_p:,.4f}")
+                    logger.info(f"[RISK GUARD] Tracking new LONG position: {pair} @ ${price:,.4f} | Stop: ${stop_p:,.4f}")
                 else:
                     # Update quantity and peak
                     pos = self.active_positions[pair]
                     pos.quantity = tot_qty
-                    if price > pos.peak_price:
+                    if price > pos.peak_price and pos.side == "LONG":
                         pos.peak_price = price
+
+        # Also synchronize active short positions from /v6/short_positions
+        try:
+            short_resp = self.roostoo.get_short_positions()
+            short_positions = short_resp.get("Positions", short_resp.get("Data", []))
+            if isinstance(short_positions, list):
+                for spos in short_positions:
+                    spair = spos.get("Pair", spos.get("pair", ""))
+                    if not spair:
+                        continue
+                    key = f"SHORT_{spair}"
+                    current_pairs.add(key)
+                    sentry = float(spos.get("EntryPrice", spos.get("entry_price", tickers.get(spair, {}).get("LastPrice", 0.0))))
+                    sqty = float(spos.get("Quantity", spos.get("quantity", 0.0)))
+                    sprice = tickers.get(spair, {}).get("LastPrice", sentry)
+
+                    if key not in self.active_positions and sentry > 0:
+                        stop_p = sentry * (1.0 + settings.SHORT_STOP_LOSS_PCT / 100.0)
+                        self.active_positions[key] = PositionTracker(
+                            pair=spair,
+                            entry_price=sentry,
+                            peak_price=sprice,
+                            quantity=sqty,
+                            effective_stop_price=stop_p,
+                            is_ratcheted=False,
+                            is_trailing=False,
+                            side="SHORT"
+                        )
+                        logger.info(f"[RISK GUARD] Tracking new SHORT position: {spair} @ ${sentry:,.4f} | Stop: ${stop_p:,.4f}")
+                    elif key in self.active_positions:
+                        pos = self.active_positions[key]
+                        pos.quantity = sqty
+                        if sprice < pos.peak_price:  # Track lowest price for short
+                            pos.peak_price = sprice
+        except Exception as e:
+            logger.debug(f"Note: Error checking short positions in risk guard: {e}")
 
         # Remove closed positions
         for p in list(self.active_positions.keys()):
@@ -123,59 +161,111 @@ class RiskGuard:
         # 2. Synchronize position state
         self.update_positions_from_wallet(tickers, snapshot.exchange_info)
 
-        # 3. Audit Individual Open Positions
-        for pair, pos in list(self.active_positions.items()):
-            curr_price = tickers.get(pair, {}).get("LastPrice", 0.0)
+        # 3. Audit Individual Open Positions (Long and Short)
+        for key, pos in list(self.active_positions.items()):
+            curr_price = tickers.get(pos.pair, {}).get("LastPrice", 0.0)
             if curr_price <= 0:
                 continue
 
-            gain_pct = (curr_price - pos.entry_price) / pos.entry_price * 100.0
-
-            # Update Peak
-            if curr_price > pos.peak_price:
-                pos.peak_price = curr_price
-
-            # Check Stage 1: Breakeven Profit Ratchet (+2.0% -> +0.4%)
-            if gain_pct >= settings.PROFIT_RATCHET_TRIGGER_PCT and not pos.is_ratcheted:
-                new_stop = pos.entry_price * (1.0 + settings.PROFIT_RATCHET_LOCK_PCT / 100.0)
-                if new_stop > pos.effective_stop_price:
-                    pos.effective_stop_price = new_stop
-                    pos.is_ratcheted = True
-                    logger.info(
-                        f"[PROFIT RATCHET] {pair} gained +{gain_pct:.2f}%. "
-                        f"Stop ratcheted to Breakeven (+0.4% fees covered): ${new_stop:,.4f}"
-                    )
-
-            # Check Stage 2: Trailing Stop Lock (+4.0% -> Peak - 1.2%)
-            if gain_pct >= settings.TRAILING_STOP_TRIGGER_PCT:
-                pos.is_trailing = True
-                trail_stop = pos.peak_price * (1.0 - settings.TRAILING_STOP_OFFSET_PCT / 100.0)
-                if trail_stop > pos.effective_stop_price:
-                    pos.effective_stop_price = trail_stop
-                    logger.info(
-                        f"[TRAILING STOP] {pair} peak ${pos.peak_price:,.4f}. "
-                        f"Trailing stop ratcheted to ${trail_stop:,.4f}"
-                    )
-
-            # Check Order Flow Toxicity Emergency Exit
-            sym = pair.replace("/USD", "USDT")
+            sym = pos.pair.replace("/USD", "USDT")
             metric = snapshot.assets.get(sym)
-            if metric and metric.taker_imbalance_15m < -0.25 and metric.vol_zscore_15m > 2.5:
-                logger.warning(
-                    f"[TOXICITY EXIT] {pair} detected extreme order flow toxicity "
-                    f"(Imbalance: {metric.taker_imbalance_15m:.2f}, Vol Z: {metric.vol_zscore_15m:.1f}). Emergency sell!"
-                )
-                self._execute_stop_sell(pair, pos, curr_price, snapshot.exchange_info, reason="Toxicity Emergency Exit")
-                continue
 
-            # Check Stop-Loss Execution
-            if curr_price <= pos.effective_stop_price:
-                loss_or_gain = "Stop-Loss" if curr_price < pos.entry_price else "Trailing Take-Profit"
-                logger.warning(
-                    f"[{loss_or_gain.upper()} TRIGGERED] {pair} Price: ${curr_price:,.4f} <= Stop: ${pos.effective_stop_price:,.4f}. "
-                    f"Executing immediate market liquidation!"
-                )
-                self._execute_stop_sell(pair, pos, curr_price, snapshot.exchange_info, reason=loss_or_gain)
+            # ==========================================
+            # AUDIT CASE A: SPOT LONG POSITION
+            # ==========================================
+            if pos.side == "LONG":
+                gain_pct = (curr_price - pos.entry_price) / pos.entry_price * 100.0
+                if curr_price > pos.peak_price:
+                    pos.peak_price = curr_price
+
+                # Check Stage 1: Breakeven Profit Ratchet (+2.0% -> +0.4%)
+                if gain_pct >= settings.PROFIT_RATCHET_TRIGGER_PCT and not pos.is_ratcheted:
+                    new_stop = pos.entry_price * (1.0 + settings.PROFIT_RATCHET_LOCK_PCT / 100.0)
+                    if new_stop > pos.effective_stop_price:
+                        pos.effective_stop_price = new_stop
+                        pos.is_ratcheted = True
+                        logger.info(
+                            f"[PROFIT RATCHET LONG] {pos.pair} gained +{gain_pct:.2f}%. "
+                            f"Stop ratcheted to Breakeven (+0.4% fees covered): ${new_stop:,.4f}"
+                        )
+
+                # Check Stage 2: Trailing Stop Lock (+4.0% -> Peak - 1.2%)
+                if gain_pct >= settings.TRAILING_STOP_TRIGGER_PCT:
+                    pos.is_trailing = True
+                    trail_stop = pos.peak_price * (1.0 - settings.TRAILING_STOP_OFFSET_PCT / 100.0)
+                    if trail_stop > pos.effective_stop_price:
+                        pos.effective_stop_price = trail_stop
+                        logger.info(
+                            f"[TRAILING STOP LONG] {pos.pair} peak ${pos.peak_price:,.4f}. "
+                            f"Trailing stop ratcheted to ${trail_stop:,.4f}"
+                        )
+
+                # Check Order Flow Toxicity Emergency Exit (Whale Dump)
+                if metric and metric.taker_imbalance_15m < -0.25 and metric.vol_zscore_15m > 2.5:
+                    logger.warning(
+                        f"[TOXICITY EXIT] {pos.pair} detected extreme order flow toxicity "
+                        f"(Imbalance: {metric.taker_imbalance_15m:.2f}, Vol Z: {metric.vol_zscore_15m:.1f}). Emergency sell!"
+                    )
+                    self._execute_stop_sell(pos.pair, pos, curr_price, snapshot.exchange_info, reason="Toxicity Emergency Exit")
+                    continue
+
+                # Check Stop-Loss Execution
+                if curr_price <= pos.effective_stop_price:
+                    loss_or_gain = "Stop-Loss" if curr_price < pos.entry_price else "Trailing Take-Profit"
+                    logger.warning(
+                        f"[{loss_or_gain.upper()} TRIGGERED] {pos.pair} Price: ${curr_price:,.4f} <= Stop: ${pos.effective_stop_price:,.4f}. "
+                        f"Executing immediate market liquidation!"
+                    )
+                    self._execute_stop_sell(pos.pair, pos, curr_price, snapshot.exchange_info, reason=loss_or_gain)
+
+            # ==========================================
+            # AUDIT CASE B: SHORT POSITION
+            # ==========================================
+            elif pos.side == "SHORT":
+                # For a short, gain increases as price falls
+                gain_pct = (pos.entry_price - curr_price) / pos.entry_price * 100.0
+                if curr_price < pos.peak_price:
+                    pos.peak_price = curr_price  # Track lowest price achieved
+
+                # Check Stage 1: Breakeven Profit Ratchet for Short (+2.0% drop -> lock +0.4%)
+                if gain_pct >= settings.PROFIT_RATCHET_TRIGGER_PCT and not pos.is_ratcheted:
+                    new_stop = pos.entry_price * (1.0 - settings.PROFIT_RATCHET_LOCK_PCT / 100.0)
+                    if new_stop < pos.effective_stop_price:
+                        pos.effective_stop_price = new_stop
+                        pos.is_ratcheted = True
+                        logger.info(
+                            f"[PROFIT RATCHET SHORT] {pos.pair} price dropped {gain_pct:.2f}%. "
+                            f"Short stop ratcheted to lock profit (+0.4% fees covered): ${new_stop:,.4f}"
+                        )
+
+                # Check Stage 2: Trailing Stop Lock for Short (+4.0% drop -> trail 1.2% above low)
+                if gain_pct >= settings.TRAILING_STOP_TRIGGER_PCT:
+                    pos.is_trailing = True
+                    trail_stop = pos.peak_price * (1.0 + settings.TRAILING_STOP_OFFSET_PCT / 100.0)
+                    if trail_stop < pos.effective_stop_price:
+                        pos.effective_stop_price = trail_stop
+                        logger.info(
+                            f"[TRAILING STOP SHORT] {pos.pair} reached low ${pos.peak_price:,.4f}. "
+                            f"Short trailing stop ratcheted to ${trail_stop:,.4f}"
+                        )
+
+                # Check Short Squeeze Toxicity Exit (Whales aggressively absorbing buy side)
+                if metric and metric.taker_imbalance_15m > 0.25 and metric.vol_zscore_15m > 2.5:
+                    logger.warning(
+                        f"[SHORT SQUEEZE TOXICITY EXIT] {pos.pair} detected aggressive buying volume "
+                        f"(Imbalance: {metric.taker_imbalance_15m:+.2f}, Vol Z: {metric.vol_zscore_15m:.1f}). Emergency closing short!"
+                    )
+                    self._execute_short_close(pos.pair, pos, curr_price, reason="Short Squeeze Emergency Exit")
+                    continue
+
+                # Check Short Stop-Loss Execution (Price rallies above stop)
+                if curr_price >= pos.effective_stop_price:
+                    loss_or_gain = "Short Stop-Loss" if curr_price > pos.entry_price else "Short Trailing Take-Profit"
+                    logger.warning(
+                        f"[{loss_or_gain.upper()} TRIGGERED] {pos.pair} Price: ${curr_price:,.4f} >= Stop: ${pos.effective_stop_price:,.4f}. "
+                        f"Executing immediate short position close!"
+                    )
+                    self._execute_short_close(pos.pair, pos, curr_price, reason=loss_or_gain)
 
         return {"Status": "OK", "ActivePositions": len(self.active_positions)}
 
@@ -198,7 +288,28 @@ class RiskGuard:
         if pair in self.active_positions:
             del self.active_positions[pair]
 
+    def _execute_short_close(self, pair: str, pos: PositionTracker, price: float, reason: str):
+        resp = self.roostoo.short_close(pair=pair, close_pct=100.0)
+        order_id = resp.get("OrderId", resp.get("Data", {}).get("OrderId", "mock_short_close_id"))
+        pnl_pct = (pos.entry_price - price) / pos.entry_price * 100.0
+        log_trade(
+            symbol=pair,
+            side="SHORT_CLOSE",
+            price=price,
+            quantity=pos.quantity,
+            order_id=order_id,
+            api_response=resp,
+            signal_reason=f"{reason} | Short PnL: {pnl_pct:+.2f}%",
+            pnl=round(pnl_pct, 2)
+        )
+        key = f"SHORT_{pair}" if f"SHORT_{pair}" in self.active_positions else pair
+        if key in self.active_positions:
+            del self.active_positions[key]
+
     def _emergency_liquidate_all(self, tickers: Dict[str, Any], exchange_info: Dict[str, Any]):
-        for pair, pos in list(self.active_positions.items()):
-            curr_p = tickers.get(pair, {}).get("LastPrice", pos.entry_price)
-            self._execute_stop_sell(pair, pos, curr_p, exchange_info, reason="Circuit Breaker Full Liquidation")
+        for key, pos in list(self.active_positions.items()):
+            curr_p = tickers.get(pos.pair, {}).get("LastPrice", pos.entry_price)
+            if pos.side == "SHORT":
+                self._execute_short_close(pos.pair, pos, curr_p, reason="Circuit Breaker Short Liquidation")
+            else:
+                self._execute_stop_sell(pos.pair, pos, curr_p, exchange_info, reason="Circuit Breaker Full Liquidation")

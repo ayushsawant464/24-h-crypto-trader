@@ -60,7 +60,7 @@ class PortfolioRebalancer:
             logger.error("Invalid portfolio value detected. Aborting rebalance.")
             return {"Success": False, "Error": "Invalid portfolio value"}
 
-        # 1. First Pass: Sells / Liquidations (Free up USD cash)
+        # 1. First Pass: Sells / Liquidations (Free up USD cash and close obsolete shorts)
         for pair, curr_qty in list(current_holdings.items()):
             target_w = decision.target_weights.get(pair, 0.0)
             curr_price = tickers.get(pair, {}).get("LastPrice", 0.0)
@@ -68,7 +68,7 @@ class PortfolioRebalancer:
                 continue
 
             curr_usd = curr_qty * curr_price
-            target_usd = total_val * target_w
+            target_usd = total_val * max(0.0, target_w)  # If target is short or zero, liquidate long
             delta_usd = target_usd - curr_usd
 
             # If we need to sell (delta_usd < 0)
@@ -98,7 +98,32 @@ class PortfolioRebalancer:
                     )
                     time.sleep(0.3)
 
-        # 2. Second Pass: Buys (Deploy capital to top momentum targets)
+        # Check existing short positions to close if target is no longer short
+        try:
+            short_resp = self.roostoo.get_short_positions()
+            active_shorts = short_resp.get("Positions", short_resp.get("Data", []))
+            if isinstance(active_shorts, list):
+                for spos in active_shorts:
+                    spair = spos.get("Pair", spos.get("pair", ""))
+                    target_w = decision.target_weights.get(spair, 0.0)
+                    if target_w >= 0 and spair:  # No longer negative target weight
+                        logger.info(f"Rebalance SHORT CLOSE: Closing short position for {spair}")
+                        c_resp = self.roostoo.short_close(pair=spair, close_pct=100.0)
+                        log_trade(
+                            symbol=spair,
+                            side="SHORT_CLOSE",
+                            price=tickers.get(spair, {}).get("LastPrice", 0.0),
+                            quantity=float(spos.get("Quantity", spos.get("quantity", 0.0))),
+                            order_id="rebalance_short_close",
+                            api_response=c_resp,
+                            signal_reason=f"Rebalance rotation out of short | Target: {target_w*100:.1f}%",
+                            strategy_state={"regime": decision.regime}
+                        )
+                        time.sleep(0.3)
+        except Exception as e:
+            logger.debug(f"Note: Error checking short positions during rebalance: {e}")
+
+        # 2. Second Pass: Buys & Short Entries
         # Refresh balance after sells
         time.sleep(1.0)
         total_val, current_holdings = self._get_portfolio_value_and_holdings(exchange_info, tickers)
@@ -111,6 +136,27 @@ class PortfolioRebalancer:
             if curr_price <= 0:
                 continue
 
+            # CASE A: Negative target weight -> Open Short Position via /v6/short_open
+            if target_w < 0:
+                short_collateral = total_val * abs(target_w)
+                if short_collateral >= 25.0:
+                    logger.info(f"Rebalance SHORT OPEN: {pair} collateral ${short_collateral:.2f} ({abs(target_w)*100:.1f}%)")
+                    resp = self.roostoo.short_open(pair=pair, collateral_usd=short_collateral, order_type="MARKET")
+                    order_id = resp.get("OrderId", resp.get("Data", {}).get("OrderId", "mock_short_id"))
+                    log_trade(
+                        symbol=pair,
+                        side="SHORT_OPEN",
+                        price=curr_price,
+                        quantity=short_collateral / max(curr_price, 1e-6),
+                        order_id=order_id,
+                        api_response=resp,
+                        signal_reason=decision.rationales.get(pair, "Bear Market Short Hedge"),
+                        strategy_state={"regime": decision.regime, "target_weight": target_w}
+                    )
+                    time.sleep(0.3)
+                continue
+
+            # CASE B: Positive target weight -> Spot Buy
             curr_qty = current_holdings.get(pair, 0.0)
             curr_usd = curr_qty * curr_price
             target_usd = total_val * target_w

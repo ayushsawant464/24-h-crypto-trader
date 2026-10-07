@@ -140,3 +140,36 @@ Action: Market Sell (Cash)    Gain >= +4.0%: Trail Peak -1.2% Action: Emergency 
   2. Cancel all pending orders.
   3. Freeze new order entries for a mandatory **4-Hour Cooldown**.
 * **Calculus**: Caps the maximum possible portfolio drawdown at $2.0\%$, mathematically preserving top-tier Calmar ($\ge 5.0$) and Sortino ($\ge 8.0$) scores.
+
+---
+
+## 5. Directional Long-to-Short Conversion & Fee-Profit Calculus
+
+During market breakdowns (Bear Contraction), the bot can convert exposure from **Long to Short** via `/v6/short_open` to generate positive returns while the broader market drops. However, directional flipping incurs cumulative exchange frictions that must be justified mathematically.
+
+### 5.1 The Conversion Friction Hurdle
+Flipping from an existing Long position into a Short position involves three transaction stages:
+1. **Closing Long Position**: $0.10\%$ Taker Fee $+ \approx 0.02\%$ Bid-Ask Spread $= 0.12\%$
+2. **Opening Short Position**: $0.10\%$ Taker Fee $+ \approx 0.02\%$ Bid-Ask Spread $= 0.12\%$
+3. **Closing Short Position**: $0.10\%$ Taker Fee $+ \approx 0.02\%$ Bid-Ask Spread $= 0.12\%$
+
+$$\text{Total Conversion Friction } \text{Friction}_{\text{flip}} \approx 0.36\%$$
+
+### 5.2 The Net Expectancy Condition for Flipping
+A Long-to-Short transition is executed **if and only if** the expected downward move satisfies the Positive Net Expectancy Hurdle:
+
+$$\mathbb{E}[R_{\text{short, net}}] = \Big(P(\text{Down}) \times \bar{R}_{\text{down}}\Big) - \Big(P(\text{Up}) \times \bar{R}_{\text{up}}\Big) - \text{Friction}_{\text{flip}} \ge +0.80\%$$
+
+* **Condition 1 (Macro Trend Breakdown)**: Bitcoin 1-Hour Close $< \text{EMA}_{20}$ AND 12-Hour Return $< -1.5\%$.
+* **Condition 2 (Institutional Order Flow Dumping)**: Rolling 4-Hour Taker Buy Ratio $< 45.0\%$ (aggressive market-sell dominance).
+* **Condition 3 (Microstructure Stability)**: 15-Minute ATR $< 2.2 \times \overline{\text{ATR}}_{20}$ (verifies directional trend rather than an erratic, wide-spread liquidation spike).
+
+**Action When Hurdle Is NOT Met (Marginal Dips / Choppy Drift)**:
+If downward velocity is marginal (e.g., BTC down only $-0.4\%$ to $-0.8\%$), flipping to short is negative EV due to fee drag. The bot **does not short**; instead, it converts $100\%$ of capital into **USD Cash Bunker** ($0$ fees, $0$ risk, capital strictly protected).
+
+### 5.3 Risk Guard Daemon Rules for Short Positions
+Short positions carry asymmetrical upside squeeze risk. The 1-minute `RiskGuard` daemon enforces dedicated short protection:
+1. **Tighter Hard Stop-Loss**: Set at **$+2.5\%$** above short entry price (immediately liquidates via `/v6/short_close` if price rallies).
+2. **Breakeven Profit Ratchet for Shorts**: When price drops by $\ge 2.0\%$ ($+2.0\%$ short gain), stop ratchets to **Entry Price $-0.40\%$** (guarantees fees are covered and trade cannot become a loss).
+3. **Trailing Profit Lock for Shorts**: When price drops by $\ge 4.0\%$, trailing stop is pegged at **$\text{Trough Price} + 1.2\%$** (tracks lowest price achieved and locks in $>70\%$ of down-move profits).
+4. **Short Squeeze Toxicity Emergency Exit**: If 15-minute Taker Imbalance abruptly flips to $> +25.0\%$ with Volume $> 2.5\sigma$, the short is closed immediately to evade short squeezes.

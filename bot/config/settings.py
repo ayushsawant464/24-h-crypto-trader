@@ -86,9 +86,11 @@ class Settings:
     BEAR_GOLD_WEIGHT: float = 0.20              # 20% PAXG/USD (Safe-Haven Gold)
     BEAR_SHORT_HEDGE_WEIGHT: float = 0.10       # 10% Short BTC Hedge (Optional alpha)
     ENABLE_SHORTING: bool = True
+    MIN_BEAR_SHORT_DOWNSIDE_PCT: float = 1.5    # Minimum expected downside % to overcome fee friction
+    SHORT_STOP_LOSS_PCT: float = 2.5            # Tighter stop-loss for short positions (2.5%)
     
     # Risk Management & Stop Limits
-    HARD_STOP_LOSS_PCT: float = 3.5             # 3.5% initial stop-loss
+    HARD_STOP_LOSS_PCT: float = 3.5             # 3.5% initial spot stop-loss
     PROFIT_RATCHET_TRIGGER_PCT: float = 2.0     # When profit >= +2.0%
     PROFIT_RATCHET_LOCK_PCT: float = 0.40       # Lock stop to +0.40% (covers 0.2% fees)
     TRAILING_STOP_TRIGGER_PCT: float = 4.0      # When profit >= +4.0%
