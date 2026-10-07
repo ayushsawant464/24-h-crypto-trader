@@ -243,5 +243,82 @@ class TestDecisionEngine(unittest.TestCase):
         self.assertNotIn("ETH/USD", decision2.target_weights)
         self.assertEqual(decision2.target_weights["USD"], 1.0)  # 60% anchor + 20% cash + 20% unused satellite
 
+    def test_decision_engine_bear_hedged_partition_alpha(self):
+        """
+        Validates that in a Bear Market (BTC falling below EMA20), instead of simply exiting into cash,
+        the engine actively rebalances across group partitions, selecting decoupled relative-strength
+        assets (positive residual alpha, strong taker flow), and dynamically establishing a beta-neutral
+        Short BTC hedge while maintaining a healthy cash buffer.
+        """
+        engine = DecisionEngine()
+
+        # BTC in downtrend: 12h return -4.0%, below EMA20, 41% taker buy
+        btc_metric = AssetMetrics(
+            symbol="BTCUSDT", roostoo_pair="BTC/USD", last_price=80000.0, spread_pct=0.001,
+            volume_24h_usd=1_000_000_000.0, return_12h_pct=-4.0, return_4h_pct=-2.5, return_15m_pct=-0.4,
+            taker_buy_4h_pct=41.0, taker_imbalance_15m=-0.15, vol_zscore_15m=1.0, atr_15m_pct=0.6,
+            beta_to_btc=1.0, residual_alpha_pct=0.0, is_liquid=True, lag_spread_4h_pct=0.0
+        )
+
+        # Tier 2: SUI has decoupled relative strength! Positive alpha +2.5%, strong taker buy 53.5%
+        sui_metric = AssetMetrics(
+            symbol="SUIUSDT", roostoo_pair="SUI/USD", last_price=2.20, spread_pct=0.010,
+            volume_24h_usd=80_000_000.0, return_12h_pct=1.0, return_4h_pct=1.2, return_15m_pct=0.3,
+            taker_buy_4h_pct=53.5, taker_imbalance_15m=0.10, vol_zscore_15m=0.8, atr_15m_pct=0.8,
+            beta_to_btc=1.2, residual_alpha_pct=2.5, is_liquid=True, lag_spread_4h_pct=1.5
+        )
+
+        # Tier 3: LINK also displays positive alpha +1.8%, taker buy 52.0%
+        link_metric = AssetMetrics(
+            symbol="LINKUSDT", roostoo_pair="LINK/USD", last_price=16.0, spread_pct=0.012,
+            volume_24h_usd=50_000_000.0, return_12h_pct=0.0, return_4h_pct=0.5, return_15m_pct=0.1,
+            taker_buy_4h_pct=52.0, taker_imbalance_15m=0.05, vol_zscore_15m=0.5, atr_15m_pct=0.7,
+            beta_to_btc=1.0, residual_alpha_pct=1.8, is_liquid=True, lag_spread_4h_pct=1.0
+        )
+
+        # Tier 4: DOGE is bleeding with negative alpha (-2.0%) and heavy sell flow (43% taker buy)
+        doge_metric = AssetMetrics(
+            symbol="DOGEUSDT", roostoo_pair="DOGE/USD", last_price=0.12, spread_pct=0.020,
+            volume_24h_usd=40_000_000.0, return_12h_pct=-7.0, return_4h_pct=-4.0, return_15m_pct=-0.8,
+            taker_buy_4h_pct=43.0, taker_imbalance_15m=-0.25, vol_zscore_15m=1.2, atr_15m_pct=1.2,
+            beta_to_btc=1.8, residual_alpha_pct=-2.0, is_liquid=True, lag_spread_4h_pct=-1.5
+        )
+
+        snapshot = MarketSnapshot(
+            timestamp=1000000.0,
+            btc_above_ema20=False,
+            btc_taker_buy_pct=41.0,
+            btc_atr_normal=True,
+            assets={
+                "BTCUSDT": btc_metric,
+                "SUIUSDT": sui_metric,
+                "LINKUSDT": link_metric,
+                "DOGEUSDT": doge_metric
+            },
+            exchange_info={}
+        )
+
+        decision = engine.evaluate(snapshot, portfolio_state={})
+        self.assertEqual(decision.regime, "BEAR_CONTRACTION")
+
+        # 1. Resilient partition winners are allocated
+        self.assertIn("SUI/USD", decision.target_weights)
+        self.assertIn("LINK/USD", decision.target_weights)
+        self.assertGreater(decision.target_weights["SUI/USD"], 0.0)
+        self.assertGreater(decision.target_weights["LINK/USD"], 0.0)
+
+        # 2. Bleeding token DOGE is NOT allocated
+        self.assertNotIn("DOGE/USD", decision.target_weights)
+
+        # 3. Macro Short BTC hedge is dynamically sized to neutralize long beta
+        self.assertIn("BTC/USD", decision.target_weights)
+        self.assertLess(decision.target_weights["BTC/USD"], 0.0)  # Must be short!
+        # SUI (15% * 1.2 = 0.18) + LINK (10% * 1.0 = 0.10) = 0.28 long beta -> Short hedge ~ -0.308 (-30.8%)
+        self.assertLessEqual(decision.target_weights["BTC/USD"], -0.25)
+
+        # 4. Cash bunker preserves dry powder (at least 35% - 40%)
+        self.assertIn("USD", decision.target_weights)
+        self.assertGreaterEqual(decision.target_weights["USD"], 0.35)
+
 if __name__ == "__main__":
     unittest.main()

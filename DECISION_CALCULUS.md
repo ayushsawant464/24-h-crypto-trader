@@ -78,15 +78,19 @@ The bot must classify the exact statistical alpha source:
 ### Gate 5: 4-Tier Categorical Portfolio Sizing Matrix
 Portfolio capital is allocated according to institutional risk budgeting across 4 categorical tiers:
 
-| Tier | Categorical Basket | Baseline / Sideways | Bull Expansion | Bear Contraction |
+| Tier | Categorical Basket | Baseline / Sideways | Bull Expansion | Bear Contraction (Hedged Alpha) |
 | :--- | :--- | :---: | :---: | :---: |
-| **Tier 1: Core Anchor** | BTC (fallback ETH) | **60%** | **20%** | **0%** |
-| **Tier 2: Smart Contracts** | ETH, SOL, SUI | **15% - 20%** | **35%** | **0%** |
-| **Tier 3: Infrastructure & AI** | LINK, TAO, NEAR | **5% - 10%** | **15%** | **0%** |
-| **Defense / Safe Haven** | USD Cash + Short BTC Hedge | **20% Cash** | **20% Cash** | **90% Cash + 10% Short** |
+| **Tier 1: Core Anchor** | BTC (fallback ETH) | **60%** | **20%** | **Dynamic Short BTC Hedge (-10% to -35%)** |
+| **Tier 2: Smart Contracts** | ETH, SOL, SUI | **15% - 20%** | **35%** | **0% - 15% (Decoupled Alpha)** |
+| **Tier 3: Infrastructure & AI** | LINK, TAO, NEAR | **5% - 10%** | **15%** | **0% - 10% (Decoupled Alpha)** |
+| **Tier 4: Speculative Beta** | DOGE, AVAX, BNB, XRP, ADA | **0% - 5%** | **10%** | **0% - 5% (Decoupled Alpha)** |
+| **Defense / Safe Haven** | Free USD Cash Buffer | **20% Cash** | **20% Cash** | **35% - 90% Free Cash Bunker** |
 
 * **Single-Asset Cap**: Max **40%** ($40,000 USD).
-* **Minimum Cash Buffer**: Kept at $\ge 20\%$ during normal regimes, expanding to **90% - 100%** in Bear Contraction to guarantee zero downside variance ($\sigma_d \approx 0$).
+* **Bear Market Beta-Neutrality Hedging**:
+  $$\beta_{\text{long}} = \sum_{i \in \text{Longs}} w_i \cdot \beta_i, \quad w_{\text{short\_BTC}} = - \min(0.35, \max(0.10, \beta_{\text{long}} \times 1.10))$$
+  $$\text{Net Beta} = \beta_{\text{long}} + w_{\text{short\_BTC}} \le 0$$
+  The portfolio neutralizes market decline risk while harvesting idiosyncratic cross-sectional alpha $\sum w_i \alpha_i$ across group partitions. If no partition tokens pass the bear alpha gates ($\alpha_i \ge +0.40\%$, taker buy $\ge 51\%$), it smoothly defaults to the 90% Cash Bunker + 10% Short BTC.
 
 ---
 

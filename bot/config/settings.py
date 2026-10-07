@@ -90,10 +90,18 @@ class Settings:
     BULL_SPECULATIVE_WEIGHT: float = 0.10       # Tier 4: High-Beta Retail Plays
     BULL_CASH_WEIGHT: float = 0.20              # 20% Free USD Cash Buffer
 
-    # Bear Market Regime Weights (Defense & Capital Preservation)
-    BEAR_CASH_WEIGHT: float = 0.90              # 90% Free USD Cash Bunker
+    # Bear Market Regime Weights (Hedged Cross-Sectional Alpha & Partition Rebalancing)
+    BEAR_CASH_WEIGHT: float = 0.90              # Fallback 90% Cash Bunker when no partition alpha exists
     BEAR_GOLD_WEIGHT: float = 0.00              # 0.0% PAXG/USD (Eliminated: Roostoo mock exchange has no gold pairs)
-    BEAR_SHORT_HEDGE_WEIGHT: float = 0.10       # 10% Short BTC Hedge (Optional alpha)
+    BEAR_LONG_BUDGET: float = 0.30              # Max 30% Long exposure across resilient partition candidates
+    BEAR_SMART_CONTRACTS_WEIGHT: float = 0.15   # Tier 2: Smart Contract Platforms in Bear (up to 15%)
+    BEAR_INFRASTRUCTURE_WEIGHT: float = 0.10    # Tier 3: Infrastructure & AI in Bear (up to 10%)
+    BEAR_SPECULATIVE_WEIGHT: float = 0.05       # Tier 4: Speculative Beta (capped tightly at 5% in Bear)
+    BEAR_SHORT_HEDGE_WEIGHT: float = 0.10       # Minimum 10% Short BTC Hedge (scales up to match portfolio beta)
+    BEAR_MAX_SHORT_HEDGE_WEIGHT: float = 0.35   # Max 35% Short BTC Hedge
+    BEAR_HEDGE_RATIO: float = 1.10              # 1.10x hedge ratio (slight net-short / beta-neutral bias in Bear)
+    BEAR_MIN_ALPHA_PCT: float = 0.40            # Minimum residual alpha of +0.40% to qualify in bear regime
+    BEAR_MIN_CASH_BUFFER: float = 0.35          # Strict 35% minimum cash buffer in Bear for drawdown defense
     ENABLE_SHORTING: bool = True
     MIN_BEAR_SHORT_DOWNSIDE_PCT: float = 1.5    # Minimum expected downside % to overcome fee friction
     SHORT_STOP_LOSS_PCT: float = 2.5            # Tighter stop-loss for short positions (2.5%)

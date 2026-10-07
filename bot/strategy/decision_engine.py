@@ -113,22 +113,130 @@ class DecisionEngine(BaseStrategy):
             f"TakerBuy: {btc_tb:.1f}% | VolStable: {snapshot.btc_atr_normal}"
         )
 
+        def get_tier_name(sym: str) -> str:
+            # Robust normalization: handles SOL/USD, SOLUSDT, and raw SOL
+            clean_sym = sym.replace("/", "").replace("USD", "")
+            if not clean_sym.endswith("USDT"):
+                clean_sym = f"{clean_sym}USDT"
+
+            if clean_sym in settings.TIER_SMART_CONTRACTS or sym in settings.TIER_SMART_CONTRACTS:
+                return "TIER_SMART_CONTRACTS"
+            if clean_sym in settings.TIER_INFRASTRUCTURE or sym in settings.TIER_INFRASTRUCTURE:
+                return "TIER_INFRASTRUCTURE"
+            if clean_sym in settings.TIER_SPECULATIVE or sym in settings.TIER_SPECULATIVE:
+                return "TIER_SPECULATIVE"
+            return "TIER_SPECULATIVE"
+
         # =========================================================================
-        # REGIME A: BEAR CONTRACTION (Capital Defense Cash Bunker, Short Hedge)
+        # REGIME A: BEAR CONTRACTION (Hedged Cross-Sectional Alpha & Partition Rebalancing)
         # =========================================================================
         if regime == "BEAR_CONTRACTION":
-            target_weights["USD"] = settings.BEAR_CASH_WEIGHT  # 90% Free Cash Bunker
-            rationales["USD"] = "Bear Market: 90% capital protected in USD Cash Bunker to guarantee zero drawdown and 0 downside deviation."
-            expected_returns["USD"] = 0.0
+            # Screen for resilient partition candidates displaying positive residual alpha
+            # and institutional taker accumulation despite overall market downturn.
+            bear_candidates_by_tier: Dict[str, List[AssetMetrics]] = {
+                "TIER_SMART_CONTRACTS": [],
+                "TIER_INFRASTRUCTURE": [],
+                "TIER_SPECULATIVE": []
+            }
 
-            # Optional Short BTC Hedge (captures alpha from crypto decline)
+            for sym, m in snapshot.assets.items():
+                if sym in ("BTCUSDT",):
+                    continue  # Macro hedge benchmark handled separately
+
+                # Asset Quarantine Filter
+                if self.state_store and self.state_store.is_quarantined(m.roostoo_pair):
+                    continue
+
+                # Gate 2: Liquidity & Spread
+                if not m.is_liquid or m.spread_pct > settings.MAX_SPREAD_PCT:
+                    continue
+
+                # Gate 3: Order Flow Accumulation (Whale absorption against the dump)
+                if m.taker_buy_4h_pct < settings.MIN_TAKER_BUY_PCT:
+                    continue
+                if m.taker_imbalance_15m < 0.0:
+                    continue
+                if m.vol_zscore_15m > 2.5 and m.return_15m_pct < 0.0:
+                    continue
+
+                # Gate 4: Decoupled Residual Alpha (must outperform predicted market beta drop)
+                if m.residual_alpha_pct < settings.BEAR_MIN_ALPHA_PCT:
+                    continue
+
+                # Gate 5: Positive Net EV Hurdle
+                ev = self.calculate_expected_value(m)
+                if ev < self.min_expected_return:
+                    continue
+
+                tier_key = get_tier_name(sym)
+                bear_candidates_by_tier[tier_key].append(m)
+
+            # Score bear candidates: Reward residual alpha & taker buying, penalize high beta (> 1.0)
+            def score_bear_candidate(m: AssetMetrics) -> float:
+                alpha_score = m.residual_alpha_pct * 1.5
+                orderflow_score = (m.taker_buy_4h_pct - 50.0) * 0.6
+                beta_penalty = max(0.0, m.beta_to_btc - 1.0) * 0.5
+                return alpha_score + orderflow_score - beta_penalty
+
+            selected_bear_assets: Dict[str, AssetMetrics] = {}
+            for t_key, c_list in bear_candidates_by_tier.items():
+                if c_list:
+                    c_list.sort(key=score_bear_candidate, reverse=True)
+                    selected_bear_assets[t_key] = c_list[0]
+
+            bear_tier_budgets = {
+                "TIER_SMART_CONTRACTS": settings.BEAR_SMART_CONTRACTS_WEIGHT,  # 15%
+                "TIER_INFRASTRUCTURE": settings.BEAR_INFRASTRUCTURE_WEIGHT,    # 10%
+                "TIER_SPECULATIVE": settings.BEAR_SPECULATIVE_WEIGHT           # 5%
+            }
+
+            total_long_beta = 0.0
+            total_long_allocated = 0.0
+
+            if selected_bear_assets:
+                # Scale tier budgets to fit BEAR_LONG_BUDGET (30%)
+                total_budget_needed = sum(bear_tier_budgets[t_key] for t_key in selected_bear_assets.keys())
+                scale = min(1.0, settings.BEAR_LONG_BUDGET / max(total_budget_needed, 1e-6))
+
+                for t_key, m in selected_bear_assets.items():
+                    w = round(bear_tier_budgets[t_key] * scale, 3)
+                    if w >= 0.02:
+                        ev = self.calculate_expected_value(m)
+                        target_weights[m.roostoo_pair] = w
+                        rationales[m.roostoo_pair] = (
+                            f"Bear Hedged Alpha ({t_key.replace('_', ' ').title()} {w*100:.1f}%) | "
+                            f"Alpha: {m.residual_alpha_pct:+.2f}% | Beta: {m.beta_to_btc:.2f} | "
+                            f"TakerBuy: {m.taker_buy_4h_pct:.1f}%"
+                        )
+                        expected_returns[m.roostoo_pair] = ev
+                        total_long_allocated += w
+                        total_long_beta += (w * m.beta_to_btc)
+
+            # Macro Beta Hedge: Sized to offset total long portfolio beta
             if settings.ENABLE_SHORTING:
-                target_weights["BTC/USD"] = -settings.BEAR_SHORT_HEDGE_WEIGHT  # -10% Short Hedge
-                rationales["BTC/USD"] = "Bear Market Hedge: 10% 1x Short BTC position via /v6/short_open to generate positive return during market dumps."
-                expected_returns["BTC/USD"] = 1.50
-            else:
-                target_weights["USD"] = 1.00  # 100% Cash Bunker if shorting is disabled
-                rationales["USD"] = "Bear Market: 100% capital protected in USD Cash Bunker (Shorting disabled)."
+                if total_long_allocated > 0:
+                    # Dynamically size Short BTC hedge to neutralize long portfolio beta with a 1.10x hedge ratio
+                    hedge_short_w = min(
+                        settings.BEAR_MAX_SHORT_HEDGE_WEIGHT,
+                        max(settings.BEAR_SHORT_HEDGE_WEIGHT, round(total_long_beta * settings.BEAR_HEDGE_RATIO, 3))
+                    )
+                    target_weights["BTC/USD"] = -hedge_short_w
+                    rationales["BTC/USD"] = (
+                        f"Bear Macro Beta Hedge: -{hedge_short_w*100:.1f}% 1x Short BTC neutralizing "
+                        f"long beta ({total_long_beta:.2f} @ {settings.BEAR_HEDGE_RATIO:.2f}x hedge ratio)."
+                    )
+                    expected_returns["BTC/USD"] = 1.50
+                else:
+                    # No resilient longs qualified: default to baseline 10% short hedge
+                    target_weights["BTC/USD"] = -settings.BEAR_SHORT_HEDGE_WEIGHT
+                    rationales["BTC/USD"] = "Bear Market Baseline Hedge: 10% 1x Short BTC to capture market downtrend."
+                    expected_returns["BTC/USD"] = 1.50
+
+            # Defensive Cash Buffer: remainder goes into USD Cash Bunker (at least 35% - 50%)
+            encumbered = sum(abs(w) for k, w in target_weights.items() if k != "USD")
+            target_weights["USD"] = round(max(settings.BEAR_MIN_CASH_BUFFER, 1.0 - encumbered), 3)
+            rationales["USD"] = f"Bear Market Defense: {target_weights['USD']*100:.1f}% capital protected in USD Cash Bunker."
+            expected_returns["USD"] = 0.0
 
             return StrategyDecision(
                 target_weights=target_weights,
@@ -195,20 +303,6 @@ class DecisionEngine(BaseStrategy):
             alpha = m.residual_alpha_pct
             orderflow = (m.taker_buy_4h_pct - 50.0) * 0.5
             return lag_bonus + alpha + orderflow
-
-        def get_tier_name(sym: str) -> str:
-            # Robust normalization: handles SOL/USD, SOLUSDT, and raw SOL
-            clean_sym = sym.replace("/", "").replace("USD", "")
-            if not clean_sym.endswith("USDT"):
-                clean_sym = f"{clean_sym}USDT"
-
-            if clean_sym in settings.TIER_SMART_CONTRACTS or sym in settings.TIER_SMART_CONTRACTS:
-                return "TIER_SMART_CONTRACTS"
-            if clean_sym in settings.TIER_INFRASTRUCTURE or sym in settings.TIER_INFRASTRUCTURE:
-                return "TIER_INFRASTRUCTURE"
-            if clean_sym in settings.TIER_SPECULATIVE or sym in settings.TIER_SPECULATIVE:
-                return "TIER_SPECULATIVE"
-            return "TIER_SPECULATIVE"
 
         # Screen through Gates 2, 3, 4 and Net EV hurdle
         candidates_by_tier: Dict[str, List[AssetMetrics]] = {
