@@ -149,12 +149,26 @@ class RiskGuard:
                         f"Dynamic Stop ({dynamic_stop_pct:.2f}%): ${stop_p:,.4f}"
                     )
                 else:
-                    # Update quantity and peak (entry price and initial stop remain firmly anchored!)
+                    # Update quantity, calculate blended VWAP if size was added, and update peak
                     pos = self.active_positions[pair]
+                    if tot_qty > pos.quantity and pos.quantity > 0:
+                        added_qty = tot_qty - pos.quantity
+                        pos.entry_price = (pos.entry_price * pos.quantity + price * added_qty) / tot_qty
+                        # If trade hasn't moved into trailing/ratchet, update stop to anchor from new VWAP
+                        if not pos.is_ratcheted and not pos.is_trailing:
+                            sym = f"{coin}USDT"
+                            metric = snapshot.assets.get(sym) if snapshot else None
+                            atr_pct = metric.atr_15m_pct if (metric and metric.atr_15m_pct > 0) else 1.0
+                            dynamic_stop_pct = min(
+                                settings.MAX_ATR_STOP_LOSS_PCT,
+                                max(settings.HARD_STOP_LOSS_PCT, settings.DYNAMIC_ATR_MULTIPLIER * atr_pct)
+                            )
+                            pos.effective_stop_price = pos.entry_price * (1.0 - dynamic_stop_pct / 100.0)
+                        logger.info(f"[RISK GUARD] Position scaled up for {pair}: new VWAP Entry = ${pos.entry_price:,.4f}")
                     pos.quantity = tot_qty
                     if price > pos.peak_price and pos.side == "LONG":
                         pos.peak_price = price
-                        self._persist_position(pos)
+                    self._persist_position(pos)
 
         # Also synchronize active short positions from /v6/short_positions
         try:
@@ -201,10 +215,16 @@ class RiskGuard:
                         logger.info(f"[RISK GUARD] Tracking new SHORT position: {spair} @ ${sentry:,.4f} | Stop: ${stop_p:,.4f}")
                     elif key in self.active_positions:
                         pos = self.active_positions[key]
+                        if sqty > pos.quantity and pos.quantity > 0:
+                            added_qty = sqty - pos.quantity
+                            pos.entry_price = (pos.entry_price * pos.quantity + sprice * added_qty) / sqty
+                            if not pos.is_ratcheted and not pos.is_trailing:
+                                pos.effective_stop_price = pos.entry_price * (1.0 + settings.SHORT_STOP_LOSS_PCT / 100.0)
+                            logger.info(f"[RISK GUARD] Short position scaled up for {spair}: new VWAP Entry = ${pos.entry_price:,.4f}")
                         pos.quantity = sqty
                         if sprice < pos.peak_price:  # Track lowest price for short
                             pos.peak_price = sprice
-                            self._persist_position(pos)
+                        self._persist_position(pos)
         except Exception as e:
             logger.debug(f"Note: Error checking short positions in risk guard: {e}")
 
@@ -282,10 +302,12 @@ class RiskGuard:
                         scollat = sqty * sentry
 
                     upnl = (sentry - scurr_p) * sqty if (sentry > 0 and sqty > 0) else 0.0
-                    short_equity = max(0.0, scollat + upnl)
+                    short_equity = scollat + upnl
                     total_val += short_equity
         except Exception as e:
             logger.debug(f"Note: Error accounting for short equity in risk guard total_val: {e}")
+
+        total_val = max(0.0, total_val)
 
         if self.portfolio_high_watermark <= 0.0 and total_val > 0.0:
             self.portfolio_high_watermark = total_val
@@ -454,14 +476,23 @@ class RiskGuard:
                     else:
                         logger.info(f"[SHORT SQUEEZE RESISTANCE] {pos.pair} buyer spike absorbed by ask wall. Holding short.")
 
-                # Check Short Stop-Loss Execution (Price rallies above stop)
+                # Check Short Stop-Loss Execution with Single-Tick Ask-Wall Defense
                 if curr_price >= pos.effective_stop_price:
-                    loss_or_gain = "Short Stop-Loss" if curr_price > pos.entry_price else "Short Trailing Take-Profit"
-                    logger.warning(
-                        f"[{loss_or_gain.upper()} TRIGGERED] {pos.pair} Price: ${curr_price:,.4f} >= Stop: ${pos.effective_stop_price:,.4f}. "
-                        f"Executing immediate short position close!"
-                    )
-                    self._execute_short_close(pos.pair, pos, curr_price, reason=loss_or_gain)
+                    tick_info = tickers.get(pos.pair, {})
+                    ask_p = tick_info.get("AskPrice", curr_price)
+                    # If Ask price is still below stop price, treat as transient single-tick wick anomaly
+                    if ask_p < pos.effective_stop_price and curr_price >= pos.effective_stop_price:
+                        logger.info(
+                            f"[STOP DEFENSE SHORT] {pos.pair} last price ${curr_price:,.4f} wicked above stop ${pos.effective_stop_price:,.4f}, "
+                            f"but Ask is ${ask_p:,.4f}. Holding short."
+                        )
+                    else:
+                        loss_or_gain = "Short Stop-Loss" if curr_price > pos.entry_price else "Short Trailing Take-Profit"
+                        logger.warning(
+                            f"[{loss_or_gain.upper()} TRIGGERED] {pos.pair} Price: ${curr_price:,.4f} >= Stop: ${pos.effective_stop_price:,.4f}. "
+                            f"Executing immediate short position close!"
+                        )
+                        self._execute_short_close(pos.pair, pos, curr_price, reason=loss_or_gain)
 
         return {"Status": "OK", "ActivePositions": len(self.active_positions)}
 

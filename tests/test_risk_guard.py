@@ -78,8 +78,9 @@ class TestRiskGuard(unittest.TestCase):
     def test_small_account_circuit_breaker(self):
         """
         Validates that an account with $500 properly tracks dynamic HWM
-        and triggers the circuit breaker on 2.0% drawdown.
+        and triggers the circuit breaker on 5.0% drawdown.
         """
+        from bot.config.settings import settings
         client = RoostooClient()
         guard = RiskGuard(client)
         
@@ -89,13 +90,13 @@ class TestRiskGuard(unittest.TestCase):
         # Simulate initial balance of $500
         guard.portfolio_high_watermark = 500.0
         
-        # Price drops to $489.0 (drawdown = 2.2% > 2.0%)
-        curr_val = 489.0
+        # Price drops to $470.0 (drawdown = 6.0% >= 5.0%)
+        curr_val = 470.0
         drawdown = (guard.portfolio_high_watermark - curr_val) / guard.portfolio_high_watermark * 100.0
-        self.assertGreaterEqual(drawdown, 2.0)
+        self.assertGreaterEqual(drawdown, settings.PORTFOLIO_CIRCUIT_BREAKER_PCT)
         
         # Dynamic circuit breaker check works for $500 without requiring total_val > 1000
-        cb_triggered = drawdown >= 2.0 and curr_val > 0.0 and guard.portfolio_high_watermark > 0.0
+        cb_triggered = drawdown >= settings.PORTFOLIO_CIRCUIT_BREAKER_PCT and curr_val > 0.0 and guard.portfolio_high_watermark > 0.0
         self.assertTrue(cb_triggered)
 
     def test_toxicity_whipsaw_defense(self):
@@ -138,6 +139,68 @@ class TestRiskGuard(unittest.TestCase):
         
         # Because price is 100.0 > entry (99.5) and return_15m is +0.20%, is_price_breakdown is FALSE
         self.assertFalse(is_price_breakdown)
+
+    def test_vwap_position_scale_up(self):
+        """
+        Validates that when a position size is increased,
+        RiskGuard recalculates the Volume-Weighted Average Price (VWAP) blended entry price.
+        """
+        from unittest.mock import MagicMock
+        mock_client = MagicMock()
+        # Initially 10 SOL @ 100 in wallet, pos entry was 100.
+        # Now wallet has 20 SOL, and current market price is 120.
+        mock_client.get_balance.return_value = {
+            "SpotWallet": {
+                "SOL": {"Free": 20.0, "Lock": 0.0}
+            }
+        }
+        mock_client.get_short_positions.return_value = {"Positions": []}
+
+        guard = RiskGuard(mock_client)
+        guard.active_positions["SOL/USD"] = PositionTracker(
+            pair="SOL/USD",
+            entry_price=100.0,
+            peak_price=100.0,
+            quantity=10.0,
+            effective_stop_price=96.5,
+            is_ratcheted=False,
+            is_trailing=False,
+            side="LONG"
+        )
+
+        tickers = {"SOL/USD": {"LastPrice": 120.0}}
+        exchange_info = {"SOL/USD": {"AmountPrecision": 2, "MiniOrder": 1.0}}
+
+        guard.update_positions_from_wallet(tickers, exchange_info)
+
+        pos = guard.active_positions["SOL/USD"]
+        self.assertEqual(pos.quantity, 20.0)
+        # Expected VWAP = (10 * 100 + 10 * 120) / 20 = 110.0
+        self.assertEqual(pos.entry_price, 110.0)
+
+    def test_symmetric_short_wick_defense(self):
+        """
+        Validates that a single anomalous LastPrice spike above short stop
+        does NOT trigger premature liquidation if AskPrice is still below stop.
+        """
+        pos = PositionTracker(
+            pair="BTC/USD",
+            entry_price=80000.0,
+            peak_price=80000.0,
+            quantity=0.1,
+            effective_stop_price=82000.0,
+            is_ratcheted=False,
+            is_trailing=False,
+            side="SHORT"
+        )
+
+        # Last price wicked up to 82,050 (above stop of 82,000),
+        # but the real Ask book price is 81,950 (below stop)
+        curr_price = 82050.0
+        ask_price = 81950.0
+
+        is_wick_anomaly = ask_price < pos.effective_stop_price and curr_price >= pos.effective_stop_price
+        self.assertTrue(is_wick_anomaly)
 
 if __name__ == "__main__":
     unittest.main()

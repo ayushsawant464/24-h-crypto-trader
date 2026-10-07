@@ -47,13 +47,16 @@ class DecisionEngine(BaseStrategy):
         # Empirical runner extension driven by alpha and cross-crypto lag catchup
         alpha_extension = max(0.0, metric.residual_alpha_pct, getattr(metric, 'lag_spread_4h_pct', 0.0))
         r_runner = (settings.TRAILING_STOP_TRIGGER_PCT - settings.TRAILING_STOP_OFFSET_PCT + alpha_extension) * 1.25 * vol_scale
-        r_ratchet = settings.PROFIT_RATCHET_LOCK_PCT                                                    # +0.40%
-        r_drift = 1.0 * vol_scale                                                                       # +1.0%
+        r_ratchet = max(settings.PROFIT_RATCHET_LOCK_PCT, 1.0 * vol_scale)
+        r_drift = 1.0 * vol_scale
         expected_win_payoff = (0.45 * r_runner) + (0.35 * r_ratchet) + (0.20 * r_drift)
 
         # Expected loss of losing trades:
-        # Exited early via momentum decay cut (-1.2%) or hard stop
-        expected_loss_payoff = 1.30 * vol_scale
+        # Anchored honestly to dynamic stop-loss: max(3.5%, 2.2 * ATR_15m) capped at 4.5%
+        # Blended with early momentum decay exits (1.2% threshold)
+        atr_val = metric.atr_15m_pct if metric.atr_15m_pct > 0 else 1.0
+        dyn_stop = min(settings.MAX_ATR_STOP_LOSS_PCT, max(settings.HARD_STOP_LOSS_PCT, settings.DYNAMIC_ATR_MULTIPLIER * atr_val))
+        expected_loss_payoff = (0.60 * settings.EARLY_MOMENTUM_DECAY_PCT + 0.40 * dyn_stop)
 
         ev_net = (p_win * expected_win_payoff) - (p_loss * expected_loss_payoff) - self.friction_pct
         return round(ev_net, 3)
@@ -111,18 +114,12 @@ class DecisionEngine(BaseStrategy):
         )
 
         # =========================================================================
-        # REGIME A: BEAR CONTRACTION (Capital Defense, Gold Fortress, Short Hedge)
+        # REGIME A: BEAR CONTRACTION (Capital Defense Cash Bunker, Short Hedge)
         # =========================================================================
         if regime == "BEAR_CONTRACTION":
-            target_weights["USD"] = settings.BEAR_CASH_WEIGHT  # 70% Free Cash
-            rationales["USD"] = "Bear Market: 70% capital protected in USD Cash Bunker to guarantee zero drawdown."
+            target_weights["USD"] = settings.BEAR_CASH_WEIGHT  # 90% Free Cash Bunker
+            rationales["USD"] = "Bear Market: 90% capital protected in USD Cash Bunker to guarantee zero drawdown and 0 downside deviation."
             expected_returns["USD"] = 0.0
-
-            # Safe-Haven Gold allocation (PAXG/USD)
-            paxg_pair = "PAXG/USD"
-            target_weights[paxg_pair] = settings.BEAR_GOLD_WEIGHT  # 20% Gold
-            rationales[paxg_pair] = "Bear Market Safe-Haven: 20% allocation to PAXG (physical gold peg) decoupled from crypto sell-offs."
-            expected_returns[paxg_pair] = 0.20
 
             # Optional Short BTC Hedge (captures alpha from crypto decline)
             if settings.ENABLE_SHORTING:
@@ -130,7 +127,8 @@ class DecisionEngine(BaseStrategy):
                 rationales["BTC/USD"] = "Bear Market Hedge: 10% 1x Short BTC position via /v6/short_open to generate positive return during market dumps."
                 expected_returns["BTC/USD"] = 1.50
             else:
-                target_weights["USD"] += settings.BEAR_SHORT_HEDGE_WEIGHT
+                target_weights["USD"] = 1.00  # 100% Cash Bunker if shorting is disabled
+                rationales["USD"] = "Bear Market: 100% capital protected in USD Cash Bunker (Shorting disabled)."
 
             return StrategyDecision(
                 target_weights=target_weights,
@@ -170,9 +168,24 @@ class DecisionEngine(BaseStrategy):
             if eth_metric.return_12h_pct > btc_metric.return_12h_pct and eth_metric.return_12h_pct > 0.0 and eth_metric.taker_buy_4h_pct > 50.0:
                 anchor_pair = "ETH/USD"
 
-        target_weights[anchor_pair] = round(anchor_budget, 3)
-        rationales[anchor_pair] = f"Tier 1: Core Anchor ({anchor_budget*100:.0f}%) | Regime: {regime} | Mega-cap market presence."
-        expected_returns[anchor_pair] = 0.50
+        # Anchor Quarantine Check: Fallback to alternate mega-cap or USD cash if quarantined
+        if self.state_store and self.state_store.is_quarantined(anchor_pair):
+            alt_pair = "ETH/USD" if anchor_pair == "BTC/USD" else "BTC/USD"
+            if not self.state_store.is_quarantined(alt_pair):
+                logger.info(f"[DECISION ENGINE] Anchor {anchor_pair} quarantined. Switching anchor to {alt_pair}.")
+                anchor_pair = alt_pair
+                target_weights[anchor_pair] = round(anchor_budget, 3)
+                rationales[anchor_pair] = f"Tier 1: Core Anchor ({anchor_budget*100:.0f}%) | Alternate anchor ({anchor_pair}) selected due to quarantine."
+                expected_returns[anchor_pair] = 0.50
+            else:
+                logger.info(f"[DECISION ENGINE] Both BTC and ETH quarantined. Allocating anchor budget {anchor_budget*100:.0f}% to USD Cash.")
+                target_weights["USD"] = target_weights.get("USD", 0.0) + anchor_budget
+                rationales["USD"] = f"Anchor Quarantine Defense: Both BTC and ETH quarantined. Parking {anchor_budget*100:.0f}% in USD Cash."
+                expected_returns["USD"] = 0.0
+        else:
+            target_weights[anchor_pair] = round(anchor_budget, 3)
+            rationales[anchor_pair] = f"Tier 1: Core Anchor ({anchor_budget*100:.0f}%) | Regime: {regime} | Mega-cap market presence."
+            expected_returns[anchor_pair] = 0.50
 
         # --- 2. Screen & Rank Candidates Across Satellite Tiers ---
         # Helper to score candidates combining Lag Spread (catch-up bonus), Alpha, and Taker Flow
@@ -205,8 +218,8 @@ class DecisionEngine(BaseStrategy):
         }
 
         for sym, m in snapshot.assets.items():
-            if sym in ("BTCUSDT", "PAXGUSDT"):
-                continue  # Benchmark and Gold handled separately
+            if sym in ("BTCUSDT",):
+                continue  # Benchmark handled separately
 
             # Asset Quarantine Filter: do not repurchase stopped-out assets during cooloff
             if self.state_store and self.state_store.is_quarantined(m.roostoo_pair):
@@ -268,7 +281,7 @@ class DecisionEngine(BaseStrategy):
             for t_key, m in selected_tier_assets.items():
                 ev = self.calculate_expected_value(m)
                 w = min(settings.MAX_ALTCOIN_ALLOCATION, round(tier_budgets[t_key] * scale, 3))
-                if w >= 0.05:
+                if w >= 0.02:
                     target_weights[m.roostoo_pair] = w
                     rationales[m.roostoo_pair] = (
                         f"{t_key.replace('_', ' ').title()} ({w*100:.1f}%) | "

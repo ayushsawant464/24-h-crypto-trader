@@ -56,7 +56,7 @@ class Settings:
     MIN_24H_VOL_USD: float = 5_000_000.0        # Gate 2: Liquidity filter
     MAX_SPREAD_PCT: float = 0.035               # Gate 2: Max 0.035% bid-ask spread
     MIN_TAKER_BUY_PCT: float = 51.0             # Gate 3: Minimum informed taker buy %
-    MIN_EXPECTED_NET_RETURN_PCT: float = 0.35   # Core Hurdle: Realistic Multi-Outcome Net Expectancy (35 bps)
+    MIN_EXPECTED_NET_RETURN_PCT: float = 0.20   # Core Hurdle: Realistic Multi-Outcome Net Expectancy (20 bps)
     
     # Toxicity Confirmation & Early Momentum Decay Thresholds
     TOXICITY_PRICE_DROP_CONFIRMATION_PCT: float = 0.50  # Must see active price drop to confirm dump
@@ -91,8 +91,8 @@ class Settings:
     BULL_CASH_WEIGHT: float = 0.20              # 20% Free USD Cash Buffer
 
     # Bear Market Regime Weights (Defense & Capital Preservation)
-    BEAR_CASH_WEIGHT: float = 0.70              # 70% Free USD Cash Bunker
-    BEAR_GOLD_WEIGHT: float = 0.20              # 20% PAXG/USD (Safe-Haven Gold)
+    BEAR_CASH_WEIGHT: float = 0.90              # 90% Free USD Cash Bunker
+    BEAR_GOLD_WEIGHT: float = 0.00              # 0.0% PAXG/USD (Eliminated: Roostoo mock exchange has no gold pairs)
     BEAR_SHORT_HEDGE_WEIGHT: float = 0.10       # 10% Short BTC Hedge (Optional alpha)
     ENABLE_SHORTING: bool = True
     MIN_BEAR_SHORT_DOWNSIDE_PCT: float = 1.5    # Minimum expected downside % to overcome fee friction
@@ -106,11 +106,11 @@ class Settings:
     PROFIT_RATCHET_LOCK_PCT: float = 0.40       # Lock stop to +0.40% (covers 0.2% fees)
     TRAILING_STOP_TRIGGER_PCT: float = 4.0      # When profit >= +4.0%
     TRAILING_STOP_OFFSET_PCT: float = 1.20      # Trail 1.2% below peak
-    PORTFOLIO_CIRCUIT_BREAKER_PCT: float = 2.0  # Max 2% total drawdown -> 100% Cash
+    PORTFOLIO_CIRCUIT_BREAKER_PCT: float = 5.0  # Max 5% total drawdown -> 100% Cash (widened from 2% to absorb ordinary intraday noise)
     CIRCUIT_BREAKER_COOLDOWN_HOURS: int = 4
     
     # Rebalance Execution & Hysteresis Defense
-    REBALANCE_DEADBAND_PCT: float = 2.5         # 2.5% allocation deadband to prevent churn/overtrading
+    REBALANCE_DEADBAND_PCT: float = 1.5         # 1.5% max portfolio deadband to prevent churn/overtrading
     QUARANTINE_DURATION_HOURS: float = 12.0     # 12-hour cooloff after stop-loss execution
     MAX_CONCURRENT_LIQUIDATION_WORKERS: int = 2 # Worker throttle to prevent HTTP 429 rate limit bans
 

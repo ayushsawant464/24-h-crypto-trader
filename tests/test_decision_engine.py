@@ -6,7 +6,7 @@ class TestDecisionEngine(unittest.TestCase):
     def test_decision_engine_bear_contraction(self):
         """
         Validates that when BTC drops below EMA20 or experiences heavy selling,
-        the Bear Contraction regime triggers: 70% USD Cash, 20% PAXG Gold, and -10% Short BTC Hedge.
+        the Bear Contraction regime triggers: 90% USD Cash Bunker, 0% Gold (eliminated), and -10% Short BTC Hedge.
         """
         engine = DecisionEngine()
         
@@ -22,8 +22,8 @@ class TestDecisionEngine(unittest.TestCase):
 
         decision = engine.evaluate(snapshot, portfolio_state={})
         self.assertEqual(decision.regime, "BEAR_CONTRACTION")
-        self.assertEqual(decision.target_weights["USD"], 0.70)
-        self.assertEqual(decision.target_weights["PAXG/USD"], 0.20)
+        self.assertEqual(decision.target_weights["USD"], 0.90)
+        self.assertNotIn("PAXG/USD", decision.target_weights)
         self.assertEqual(decision.target_weights["BTC/USD"], -0.10)
 
     def test_decision_engine_core_satellite_sideways(self):
@@ -210,6 +210,38 @@ class TestDecisionEngine(unittest.TestCase):
         # Verify Cash Buffer is preserved
         self.assertIn("USD", decision.target_weights)
         self.assertGreaterEqual(decision.target_weights["USD"], 0.20)
+
+    def test_anchor_quarantine_fallback(self):
+        """
+        Validates that when BTC/USD is quarantined, Anchor Core falls back to ETH/USD.
+        When both BTC and ETH are quarantined, Anchor Core budget is safely parked in USD Cash.
+        """
+        from unittest.mock import MagicMock
+        mock_store = MagicMock()
+        engine = DecisionEngine(state_store=mock_store)
+
+        snapshot = MarketSnapshot(
+            timestamp=1000000.0,
+            btc_above_ema20=True,
+            btc_taker_buy_pct=48.0,
+            btc_atr_normal=True,
+            assets={},
+            exchange_info={}
+        )
+
+        # Case 1: BTC quarantined -> falls back to ETH
+        mock_store.is_quarantined.side_effect = lambda pair: pair == "BTC/USD"
+        decision = engine.evaluate(snapshot, portfolio_state={})
+        self.assertNotIn("BTC/USD", decision.target_weights)
+        self.assertIn("ETH/USD", decision.target_weights)
+        self.assertEqual(decision.target_weights["ETH/USD"], 0.60)
+
+        # Case 2: Both BTC and ETH quarantined -> anchor budget parked in USD Cash (60% + 20% = 80%)
+        mock_store.is_quarantined.side_effect = lambda pair: pair in ("BTC/USD", "ETH/USD")
+        decision2 = engine.evaluate(snapshot, portfolio_state={})
+        self.assertNotIn("BTC/USD", decision2.target_weights)
+        self.assertNotIn("ETH/USD", decision2.target_weights)
+        self.assertEqual(decision2.target_weights["USD"], 1.0)  # 60% anchor + 20% cash + 20% unused satellite
 
 if __name__ == "__main__":
     unittest.main()

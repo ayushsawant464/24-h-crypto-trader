@@ -75,11 +75,12 @@ class PortfolioRebalancer:
                         scollat = sqty * sentry
 
                     upnl = (sentry - scurr_p) * sqty if (sentry > 0 and sqty > 0) else 0.0
-                    short_equity = max(0.0, scollat + upnl)
+                    short_equity = scollat + upnl
                     total_usd_value += short_equity
         except Exception as e:
             logger.debug(f"Note: Error accounting for short equity in portfolio value: {e}")
 
+        total_usd_value = max(0.0, total_usd_value)
         return total_usd_value, holdings, free_holdings
 
     def execute_rebalance(self, decision: StrategyDecision, exchange_info: Dict[str, Any]) -> Dict[str, Any]:
@@ -110,19 +111,30 @@ class PortfolioRebalancer:
             prec_info = exchange_info.get(pair, {})
             amt_prec = prec_info.get("AmountPrecision", 4)
             mini_order = prec_info.get("MiniOrder", 1.0)
-            deadband_usd = total_val * (settings.REBALANCE_DEADBAND_PCT / 100.0)
+            # Position-relative hysteresis deadband:
+            # - For exits (target_w <= 0): deadband is just mini_order
+            # - For active positions: bounded by 15% of target position or portfolio deadband
+            deadband_usd = max(mini_order, min(total_val * (settings.REBALANCE_DEADBAND_PCT / 100.0), abs(target_usd) * 0.15))
 
             # Eliminate dust accumulation and enforce hysteresis deadband:
-            # - If target_w == 0 (demoted/liquidated), liquidate 100% down to mini_order
-            # - If target_w > 0, rebalance only if allocation deviation exceeds the 2.5% deadband
-            should_sell = (target_w == 0.0 and curr_usd >= mini_order) or (target_w > 0.0 and delta_usd < -max(mini_order, deadband_usd))
+            # - If target_w <= 0 (demoted/liquidated/switched to short), liquidate 100% of spot long down to mini_order
+            # - If target_w > 0, rebalance only if allocation deviation exceeds position-relative deadband
+            should_sell = (target_w <= 0.0 and curr_usd >= mini_order) or (target_w > 0.0 and delta_usd < -deadband_usd)
 
             if should_sell:
                 curr_free = free_holdings.get(pair, 0.0)
-                # If coins are locked by stale pending orders, cancel them to free balance
+                # If coins are locked by stale pending orders, query and cancel them to free balance
                 if curr_qty > curr_free:
                     try:
-                        self.roostoo.cancel_order(pair=pair)
+                        q_resp = self.roostoo.query_order(pair=pair, pending_only=True)
+                        pending_orders = q_resp.get("Orders", q_resp.get("Data", []))
+                        if isinstance(pending_orders, list) and pending_orders:
+                            for po in pending_orders:
+                                p_id = po.get("OrderId") or po.get("order_id")
+                                if p_id:
+                                    self.roostoo.cancel_order(order_id=p_id)
+                        else:
+                            self.roostoo.cancel_order(pair=pair)
                         time.sleep(0.2)
                         b_resp = self.roostoo.get_balance()
                         c_coin = pair.split("/")[0]
@@ -207,9 +219,10 @@ class PortfolioRebalancer:
                 target_short_collateral = total_val * abs(target_w)
                 existing_collateral = active_shorts_map.get(pair, 0.0)
                 collateral_delta = target_short_collateral - existing_collateral
-                deadband_usd = total_val * (settings.REBALANCE_DEADBAND_PCT / 100.0)
+                # Position-relative deadband for shorts: bounded by 15% of target short or portfolio deadband
+                deadband_usd = max(25.0, min(total_val * (settings.REBALANCE_DEADBAND_PCT / 100.0), target_short_collateral * 0.15))
 
-                if collateral_delta >= max(25.0, deadband_usd):
+                if collateral_delta >= deadband_usd:
                     logger.info(
                         f"Rebalance SHORT OPEN: {pair} collateral delta ${collateral_delta:.2f} "
                         f"(Target: ${target_short_collateral:.2f}, Existing: ${existing_collateral:.2f})"
@@ -227,7 +240,7 @@ class PortfolioRebalancer:
                         strategy_state={"regime": decision.regime, "target_weight": target_w}
                     )
                     time.sleep(0.3)
-                elif collateral_delta < -max(25.0, deadband_usd) and existing_collateral > 0:
+                elif collateral_delta < -deadband_usd and existing_collateral > 0:
                     # Scale down short when target short weight was reduced
                     reduce_collateral = abs(collateral_delta)
                     close_pct = min(100.0, (reduce_collateral / existing_collateral) * 100.0)
@@ -274,10 +287,11 @@ class PortfolioRebalancer:
             prec_info = exchange_info.get(pair, {})
             amt_prec = prec_info.get("AmountPrecision", 4)
             mini_order = prec_info.get("MiniOrder", 1.0)
-            deadband_usd = total_val * (settings.REBALANCE_DEADBAND_PCT / 100.0)
+            # Position-relative deadband for buys: bounded by 15% of target position or portfolio deadband
+            deadband_usd = max(mini_order, min(total_val * (settings.REBALANCE_DEADBAND_PCT / 100.0), target_usd * 0.15))
 
             # If we need to buy (delta_usd exceeds mini_order and hysteresis deadband)
-            if delta_usd >= max(mini_order, deadband_usd) and avail_free_usd >= mini_order:
+            if delta_usd >= deadband_usd and avail_free_usd >= mini_order:
                 # Cap buy by actual free USD cash available with a 0.5% buffer for trading fees
                 effective_buy_usd = min(delta_usd, avail_free_usd * 0.995)
                 buy_qty = effective_buy_usd / curr_price

@@ -101,5 +101,49 @@ class TestRebalancer(unittest.TestCase):
         self.assertEqual(call_kwargs["pair"], "BTC/USD")
         self.assertAlmostEqual(call_kwargs["close_pct"], 40.0, places=1)
 
+    def test_spot_long_liquidated_when_switching_to_short(self):
+        """
+        Validates that when target weight switches to negative (short hedge, target_w = -0.10),
+        any existing spot long is 100% liquidated before opening the short.
+        """
+        mock_client = MagicMock()
+        # Holding 0.5 BTC spot in wallet
+        mock_client.get_balance.return_value = {
+            "Wallet": {
+                "USD": {"Free": 10000.0, "Lock": 0.0},
+                "BTC": {"Free": 0.5, "Lock": 0.0}
+            }
+        }
+        mock_client.get_ticker.return_value = {
+            "Data": {
+                "BTC/USD": {"LastPrice": 80000.0}
+            }
+        }
+        mock_client.get_short_positions.return_value = {"Positions": []}
+        mock_client.place_order.return_value = {"OrderId": "liquidate_btc_spot"}
+        mock_client.short_open.return_value = {"OrderId": "open_btc_short"}
+
+        rebalancer = PortfolioRebalancer(mock_client)
+        exchange_info = {
+            "BTC/USD": {"AmountPrecision": 4, "MiniOrder": 1.0}
+        }
+
+        # Target is -10% short BTC
+        decision = StrategyDecision(
+            target_weights={"USD": 0.90, "BTC/USD": -0.10},
+            regime="BEAR_CONTRACTION",
+            rationales={"BTC/USD": "Bear hedge"},
+            expected_returns={}
+        )
+
+        rebalancer.execute_rebalance(decision, exchange_info)
+
+        # Must have called place_order with SELL for 0.5 BTC
+        mock_client.place_order.assert_called()
+        call_kwargs = mock_client.place_order.call_args.kwargs
+        self.assertEqual(call_kwargs["pair"], "BTC/USD")
+        self.assertEqual(call_kwargs["side"], "SELL")
+        self.assertEqual(call_kwargs["quantity"], 0.5)
+
 if __name__ == "__main__":
     unittest.main()

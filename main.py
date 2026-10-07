@@ -108,6 +108,21 @@ def run_bot(mode: str = None):
         except Exception as e:
             logger.exception(f"Unexpected error in main loop: {e}")
             time.sleep(5)
+    # Clean shutdown hook: flush state and positions to disk
+    logger.info("Flushing active state and positions to disk before shutdown...")
+    try:
+        if risk_guard and risk_guard.active_positions:
+            for p_pair, pos in risk_guard.active_positions.items():
+                risk_guard._persist_position(pos)
+        if state_store and risk_guard:
+            state_store.save_circuit_breaker(
+                risk_guard.portfolio_high_watermark,
+                risk_guard.circuit_breaker_active,
+                risk_guard.circuit_breaker_until
+            )
+        logger.info("[CLEAN SHUTDOWN] All active positions and circuit breaker state safely persisted.")
+    except Exception as e:
+        logger.error(f"Error persisting state during shutdown: {e}")
 
     logger.info("Bot execution halted cleanly. Exiting.")
 

@@ -83,11 +83,10 @@ Portfolio capital is allocated according to institutional risk budgeting across 
 | **Tier 1: Core Anchor** | BTC (fallback ETH) | **60%** | **20%** | **0%** |
 | **Tier 2: Smart Contracts** | ETH, SOL, SUI | **15% - 20%** | **35%** | **0%** |
 | **Tier 3: Infrastructure & AI** | LINK, TAO, NEAR | **5% - 10%** | **15%** | **0%** |
-| **Tier 4: Speculative Beta** | DOGE, AVAX, BNB, XRP, ADA | **0% - 5%** | **10%** | **0%** |
-| **Defense / Safe Haven** | USD Cash + PAXG Gold + Short BTC | **20% Cash** | **20% Cash** | **70% Cash + 20% PAXG + 10% Short** |
+| **Defense / Safe Haven** | USD Cash + Short BTC Hedge | **20% Cash** | **20% Cash** | **90% Cash + 10% Short** |
 
 * **Single-Asset Cap**: Max **40%** ($40,000 USD).
-* **Minimum Cash Buffer**: Kept at $\ge 15\% - 20\%$ to absorb exchange taker fees (0.10%) and ensure zero liquidation risk.
+* **Minimum Cash Buffer**: Kept at $\ge 20\%$ during normal regimes, expanding to **90% - 100%** in Bear Contraction to guarantee zero downside variance ($\sigma_d \approx 0$).
 
 ---
 
