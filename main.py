@@ -30,12 +30,15 @@ def handle_signal(sig, frame):
     logger.info(f"Received signal {sig}. Initiating graceful bot shutdown...")
     running = False
 
-def run_bot():
+def run_bot(mode: str = None):
     signal.signal(signal.SIGINT, handle_signal)
     signal.signal(signal.SIGTERM, handle_signal)
 
+    if mode:
+        settings.switch_mode(mode)
+
     logger.info("==================================================")
-    logger.info("Starting Roostoo Autonomous Quantitative Trading Bot")
+    logger.info(f"Starting Roostoo Autonomous Quantitative Trading Bot (Mode: {settings.BOT_MODE.upper()})")
     logger.info(f"Target Base URL: {settings.ROOSTOO_BASE_URL}")
     logger.info(f"Rebalance Interval: {settings.REBALANCE_INTERVAL_HOURS} Hours")
     logger.info(f"Risk Audit Interval: {settings.RISK_CHECK_INTERVAL_SECONDS} Seconds")
@@ -104,4 +107,8 @@ def run_bot():
     logger.info("Bot execution halted cleanly. Exiting.")
 
 if __name__ == "__main__":
-    run_bot()
+    import argparse
+    parser = argparse.ArgumentParser(description="Roostoo Quantitative Trading Bot")
+    parser.add_argument("--mode", choices=["test", "prod"], default=None, help="Execution mode ('test' or 'prod')")
+    args = parser.parse_args()
+    run_bot(mode=args.mode)

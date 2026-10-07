@@ -7,11 +7,40 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 load_dotenv(PROJECT_ROOT / ".env")
 
 class Settings:
-    # API Credentials
+    # Environment Mode ('test' or 'prod')
+    BOT_MODE: str = os.getenv("BOT_MODE", "test").lower()
+
     ROOSTOO_BASE_URL: str = os.getenv("ROOSTOO_BASE_URL", "https://mock-api.roostoo.com")
-    ROOSTOO_API_KEY: str = os.getenv("ROOSTOO_API_KEY", "")
-    ROOSTOO_SECRET_KEY: str = os.getenv("ROOSTOO_SECRET_KEY", "")
-    
+
+    # Dual API Credentials
+    ROOSTOO_TEST_API_KEY: str = os.getenv("ROOSTOO_TEST_API_KEY", "")
+    ROOSTOO_TEST_SECRET_KEY: str = os.getenv("ROOSTOO_TEST_SECRET_KEY", "")
+    ROOSTOO_PROD_API_KEY: str = os.getenv("ROOSTOO_PROD_API_KEY", "")
+    ROOSTOO_PROD_SECRET_KEY: str = os.getenv("ROOSTOO_PROD_SECRET_KEY", "")
+
+    # Active Credentials (dynamically resolved)
+    ROOSTOO_API_KEY: str = ""
+    ROOSTOO_SECRET_KEY: str = ""
+
+    def __init__(self):
+        self._resolve_credentials()
+
+    def _resolve_credentials(self):
+        if self.BOT_MODE == "prod":
+            self.ROOSTOO_API_KEY = self.ROOSTOO_PROD_API_KEY or os.getenv("ROOSTOO_API_KEY", "")
+            self.ROOSTOO_SECRET_KEY = self.ROOSTOO_PROD_SECRET_KEY or os.getenv("ROOSTOO_SECRET_KEY", "")
+        else:
+            self.ROOSTOO_API_KEY = self.ROOSTOO_TEST_API_KEY or os.getenv("ROOSTOO_API_KEY", "")
+            self.ROOSTOO_SECRET_KEY = self.ROOSTOO_TEST_SECRET_KEY or os.getenv("ROOSTOO_SECRET_KEY", "")
+
+    def switch_mode(self, mode: str):
+        """Switches active credentials between 'test' and 'prod'"""
+        mode = mode.lower()
+        if mode not in ("test", "prod"):
+            raise ValueError(f"Invalid mode '{mode}'. Must be 'test' or 'prod'.")
+        self.BOT_MODE = mode
+        self._resolve_credentials()
+
     # Binance Public API for Market/Order Flow Feed
     BINANCE_BASE_URL: str = "https://api.binance.com"
 
