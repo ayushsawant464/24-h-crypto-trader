@@ -26,6 +26,8 @@ class AssetMetrics:
     residual_alpha_pct: float
     is_liquid: bool
     lag_spread_4h_pct: float = 0.0
+    high_15m: float = 0.0
+    low_15m: float = 0.0
 
 @dataclass
 class MarketSnapshot:
@@ -214,7 +216,9 @@ class MarketFeed:
                 beta_to_btc=beta,
                 residual_alpha_pct=residual_alpha,
                 is_liquid=is_liquid,
-                lag_spread_4h_pct=lag_spread_4h
+                lag_spread_4h_pct=lag_spread_4h,
+                high_15m=float(df_15m['high'].iloc[-1]) if not df_15m.empty else (last_p if last_p > 0 else 0.0),
+                low_15m=float(df_15m['low'].iloc[-1]) if not df_15m.empty else (last_p if last_p > 0 else 0.0)
             )
 
         return MarketSnapshot(

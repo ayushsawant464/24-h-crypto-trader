@@ -1,5 +1,7 @@
+from decimal import Decimal, ROUND_DOWN
 import math
 import time
+import concurrent.futures
 from typing import Dict, Any, Optional
 from dataclasses import dataclass
 from bot.config.settings import settings
@@ -8,11 +10,14 @@ from bot.data.market_feed import MarketSnapshot
 from bot.logs.logger import logger, log_trade
 
 def floor_to_precision(val: float, precision: int) -> float:
-    """Floors quantity down to precision to prevent Insufficient Balance errors."""
+    """Decimal-safe truncation down to precision to eliminate floating-point representation bugs."""
+    if val <= 0:
+        return 0.0
     if precision <= 0:
-        return float(math.floor(val))
-    factor = 10 ** precision
-    return math.floor(val * factor) / factor
+        return float(int(Decimal(str(val)).quantize(Decimal('1'), rounding=ROUND_DOWN)))
+    q = Decimal('10') ** -precision
+    d_val = Decimal(str(val)).quantize(q, rounding=ROUND_DOWN)
+    return float(d_val)
 
 @dataclass
 class PositionTracker:
@@ -91,7 +96,20 @@ class RiskGuard:
                         continue
                     key = f"SHORT_{spair}"
                     current_pairs.add(key)
-                    sentry = float(spos.get("EntryPrice", spos.get("entry_price", tickers.get(spair, {}).get("LastPrice", 0.0))))
+                    sentry = 0.0
+                    for ep_field in ("EntryPrice", "entry_price", "OpenPrice", "open_price", "AvgPrice"):
+                        if ep_field in spos and spos[ep_field]:
+                            try:
+                                sentry = float(spos[ep_field])
+                                if sentry > 0:
+                                    break
+                            except (ValueError, TypeError):
+                                pass
+                    if sentry <= 0 and key in self.active_positions:
+                        sentry = self.active_positions[key].entry_price
+                    elif sentry <= 0:
+                        sentry = tickers.get(spair, {}).get("LastPrice", 0.0)
+
                     sqty = float(spos.get("Quantity", spos.get("quantity", 0.0)))
                     sprice = tickers.get(spair, {}).get("LastPrice", sentry)
 
@@ -162,7 +180,12 @@ class RiskGuard:
         for coin, val in wallet.items():
             if coin != "USD":
                 qty = float(val.get("Free", 0.0)) + float(val.get("Lock", 0.0))
-                p = tickers.get(f"{coin}/USD", {}).get("LastPrice", 0.0)
+                tick_info = tickers.get(f"{coin}/USD", {})
+                last_p = tick_info.get("LastPrice", 0.0)
+                ask_p = tick_info.get("AskPrice", last_p)
+                bid_p = tick_info.get("BidPrice", last_p)
+                # Filter Spread Illusions: Use mid-price when bid/ask available to prevent false drawdown
+                p = (ask_p + bid_p) / 2.0 if (ask_p > 0 and bid_p > 0) else last_p
                 total_val += (qty * p)
 
         if self.portfolio_high_watermark <= 0.0 and total_val > 0.0:
@@ -199,6 +222,11 @@ class RiskGuard:
             # ==========================================
             if pos.side == "LONG":
                 gain_pct = (curr_price - pos.entry_price) / pos.entry_price * 100.0
+                
+                # Intra-Period Peak Tracking: Stream candle high to catch violent wicks between 60s ticks
+                candle_high = metric.high_15m if (metric and metric.high_15m > 0) else curr_price
+                if candle_high > pos.peak_price:
+                    pos.peak_price = candle_high
                 if curr_price > pos.peak_price:
                     pos.peak_price = curr_price
 
@@ -265,6 +293,11 @@ class RiskGuard:
             elif pos.side == "SHORT":
                 # For a short, gain increases as price falls
                 gain_pct = (pos.entry_price - curr_price) / pos.entry_price * 100.0
+
+                # Intra-Period Trough Tracking: Stream candle low to catch violent dips
+                candle_low = metric.low_15m if (metric and metric.low_15m > 0) else curr_price
+                if candle_low < pos.peak_price:
+                    pos.peak_price = candle_low
                 if curr_price < pos.peak_price:
                     pos.peak_price = curr_price  # Track lowest price achieved
 
@@ -369,9 +402,21 @@ class RiskGuard:
             del self.active_positions[key]
 
     def _emergency_liquidate_all(self, tickers: Dict[str, Any], exchange_info: Dict[str, Any]):
-        for key, pos in list(self.active_positions.items()):
+        """
+        Asynchronously executes full portfolio liquidation across all positions concurrently
+        via ThreadPoolExecutor to minimize latency and slippage during flash crashes.
+        """
+        def _liquidate_item(item):
+            key, pos = item
             curr_p = tickers.get(pos.pair, {}).get("LastPrice", pos.entry_price)
             if pos.side == "SHORT":
                 self._execute_short_close(pos.pair, pos, curr_p, reason="Circuit Breaker Short Liquidation")
             else:
                 self._execute_stop_sell(pos.pair, pos, curr_p, exchange_info, reason="Circuit Breaker Full Liquidation")
+
+        items = list(self.active_positions.items())
+        if not items:
+            return
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(items))) as executor:
+            list(executor.map(_liquidate_item, items))

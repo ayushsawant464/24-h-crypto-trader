@@ -1,3 +1,4 @@
+from decimal import Decimal, ROUND_DOWN
 import math
 import time
 from typing import Dict, Any, Tuple
@@ -7,11 +8,14 @@ from bot.strategy.base import StrategyDecision
 from bot.logs.logger import logger, log_trade
 
 def floor_to_precision(val: float, precision: int) -> float:
-    """Floors quantity down to precision to prevent Insufficient Balance errors."""
+    """Decimal-safe truncation down to precision to eliminate floating-point representation bugs."""
+    if val <= 0:
+        return 0.0
     if precision <= 0:
-        return float(math.floor(val))
-    factor = 10 ** precision
-    return math.floor(val * factor) / factor
+        return float(int(Decimal(str(val)).quantize(Decimal('1'), rounding=ROUND_DOWN)))
+    q = Decimal('10') ** -precision
+    d_val = Decimal(str(val)).quantize(q, rounding=ROUND_DOWN)
+    return float(d_val)
 
 class PortfolioRebalancer:
     """
@@ -24,6 +28,7 @@ class PortfolioRebalancer:
     def _get_portfolio_value_and_holdings(self, exchange_info: Dict[str, Any], tickers: Dict[str, Any]) -> Tuple[float, Dict[str, float], Dict[str, float]]:
         """
         Calculates total portfolio USD value, total asset quantities, and strictly free asset quantities from /v3/balance.
+        Also includes active short positions and unrealized PnL to prevent portfolio value distortion.
         """
         balance_resp = self.roostoo.get_balance()
         wallet = balance_resp.get("Wallet", {})
@@ -38,7 +43,7 @@ class PortfolioRebalancer:
         locked_usd = float(usd_info.get("Lock", 0.0))
         total_usd_value += (free_usd + locked_usd)
 
-        # Non-USD Crypto assets
+        # Non-USD Spot Crypto assets
         for coin, val in wallet.items():
             if coin == "USD":
                 continue
@@ -53,6 +58,27 @@ class PortfolioRebalancer:
                 holdings[pair] = tot_qty
                 free_holdings[pair] = free_qty
                 total_usd_value += (tot_qty * price)
+
+        # Account for active short positions collateral & unrealized PnL
+        try:
+            s_resp = self.roostoo.get_short_positions()
+            active_shorts = s_resp.get("Positions", s_resp.get("Data", []))
+            if isinstance(active_shorts, list):
+                for spos in active_shorts:
+                    spair = spos.get("Pair", spos.get("pair", ""))
+                    scollat = float(spos.get("Collateral", spos.get("collateral", 0.0)))
+                    sentry = float(spos.get("EntryPrice", spos.get("entry_price", spos.get("OpenPrice", 0.0))))
+                    sqty = float(spos.get("Quantity", spos.get("quantity", 0.0)))
+                    scurr_p = tickers.get(spair, {}).get("LastPrice", sentry)
+
+                    if scollat <= 0 and sqty > 0 and sentry > 0:
+                        scollat = sqty * sentry
+
+                    upnl = (sentry - scurr_p) * sqty if (sentry > 0 and sqty > 0) else 0.0
+                    short_equity = max(0.0, scollat + upnl)
+                    total_usd_value += short_equity
+        except Exception as e:
+            logger.debug(f"Note: Error accounting for short equity in portfolio value: {e}")
 
         return total_usd_value, holdings, free_holdings
 
@@ -81,8 +107,16 @@ class PortfolioRebalancer:
             target_usd = total_val * max(0.0, target_w)  # If target is short or zero, liquidate long
             delta_usd = target_usd - curr_usd
 
-            # If we need to sell (delta_usd < 0)
-            if delta_usd < -25.0:  # Avoid micro dust trades < $25
+            prec_info = exchange_info.get(pair, {})
+            amt_prec = prec_info.get("AmountPrecision", 4)
+            mini_order = prec_info.get("MiniOrder", 1.0)
+
+            # Eliminate dust accumulation:
+            # - If target_w == 0 (demoted/liquidated), liquidate 100% down to mini_order
+            # - If target_w > 0, rebalance if delta exceeds mini_order
+            should_sell = (target_w == 0.0 and curr_usd >= mini_order) or (delta_usd < -max(mini_order, 5.0))
+
+            if should_sell:
                 curr_free = free_holdings.get(pair, 0.0)
                 # If coins are locked by stale pending orders, cancel them to free balance
                 if curr_qty > curr_free:
@@ -95,14 +129,10 @@ class PortfolioRebalancer:
                     except Exception as e:
                         logger.debug(f"Note: Error cancelling pending order for {pair}: {e}")
 
-                sell_usd = abs(delta_usd)
+                sell_usd = abs(delta_usd) if target_w > 0 else curr_usd
                 sell_qty = sell_usd / curr_price
                 
-                # Apply AmountPrecision using FLOOR strictly bounded by free quantity!
-                prec_info = exchange_info.get(pair, {})
-                amt_prec = prec_info.get("AmountPrecision", 4)
-                mini_order = prec_info.get("MiniOrder", 1.0)
-                
+                # Apply AmountPrecision using DECIMAL-SAFE FLOOR strictly bounded by free quantity!
                 sell_qty_floored = min(curr_free, floor_to_precision(sell_qty, amt_prec))
                 if sell_qty_floored * curr_price >= mini_order and sell_qty_floored > 0:
                     logger.info(f"Rebalance SELL: {sell_qty_floored} {pair} (~${sell_qty_floored*curr_price:.2f}) [Free: {curr_free}]")
@@ -157,19 +187,21 @@ class PortfolioRebalancer:
 
         # 2. Second Pass: Buys & Short Entries
         # Refresh balance after sells
-        time.sleep(1.0)
+        time.sleep(0.5)
         total_val, current_holdings, free_holdings = self._get_portfolio_value_and_holdings(exchange_info, tickers)
 
         for pair, target_w in decision.target_weights.items():
             if pair == "USD":
                 continue  # Cash buffer stays uninvested
 
-            curr_price = tickers.get(pair, {}).get("LastPrice", 0.0)
-            if curr_price <= 0:
-                continue
-
             # CASE A: Negative target weight -> Open/Adjust Short Position via /v6/short_open
             if target_w < 0:
+                fresh_tickers_resp = self.roostoo.get_ticker()
+                fresh_tickers = fresh_tickers_resp.get("Data", tickers)
+                curr_price = fresh_tickers.get(pair, {}).get("LastPrice", 0.0)
+                if curr_price <= 0:
+                    continue
+
                 target_short_collateral = total_val * abs(target_w)
                 existing_collateral = active_shorts_map.get(pair, 0.0)
                 collateral_delta = target_short_collateral - existing_collateral
@@ -193,7 +225,7 @@ class PortfolioRebalancer:
                     )
                     time.sleep(0.3)
                 elif collateral_delta < -25.0 and existing_collateral > 0:
-                    # CRITICAL FIX: Scale down short when target short weight was reduced!
+                    # Scale down short when target short weight was reduced
                     reduce_collateral = abs(collateral_delta)
                     close_pct = min(100.0, (reduce_collateral / existing_collateral) * 100.0)
                     logger.info(
@@ -220,21 +252,37 @@ class PortfolioRebalancer:
                 continue
 
             # CASE B: Positive target weight -> Spot Buy
+            # CRITICAL FIX: Synchronize Real-Time Pricing & Free Cash immediately before each buy order!
+            fresh_tickers_resp = self.roostoo.get_ticker()
+            fresh_tickers = fresh_tickers_resp.get("Data", tickers)
+            curr_price = fresh_tickers.get(pair, {}).get("LastPrice", 0.0)
+            if curr_price <= 0:
+                continue
+
+            fresh_bal = self.roostoo.get_balance()
+            avail_free_usd = float(fresh_bal.get("Wallet", {}).get("USD", {}).get("Free", 0.0))
+
             curr_qty = current_holdings.get(pair, 0.0)
             curr_usd = curr_qty * curr_price
             target_usd = total_val * target_w
             delta_usd = target_usd - curr_usd
 
-            # If we need to buy (delta_usd > 0)
-            if delta_usd > 25.0:
-                buy_qty = delta_usd / curr_price
-                prec_info = exchange_info.get(pair, {})
-                amt_prec = prec_info.get("AmountPrecision", 4)
-                mini_order = prec_info.get("MiniOrder", 1.0)
+            prec_info = exchange_info.get(pair, {})
+            amt_prec = prec_info.get("AmountPrecision", 4)
+            mini_order = prec_info.get("MiniOrder", 1.0)
+
+            # If we need to buy (delta_usd > mini_order)
+            if delta_usd >= max(mini_order, 5.0) and avail_free_usd >= mini_order:
+                # Cap buy by actual free USD cash available with a 0.5% buffer for trading fees
+                effective_buy_usd = min(delta_usd, avail_free_usd * 0.995)
+                buy_qty = effective_buy_usd / curr_price
 
                 buy_qty_floored = floor_to_precision(buy_qty, amt_prec)
-                if buy_qty_floored * curr_price >= mini_order:
-                    logger.info(f"Rebalance BUY: {buy_qty_floored} {pair} (~${delta_usd:.2f})")
+                if buy_qty_floored * curr_price >= mini_order and buy_qty_floored > 0:
+                    logger.info(
+                        f"Rebalance BUY: {buy_qty_floored} {pair} (~${buy_qty_floored*curr_price:.2f}) "
+                        f"[Avail Free USD: ${avail_free_usd:.2f}]"
+                    )
                     resp = self.roostoo.place_order(pair=pair, side="BUY", quantity=buy_qty_floored, order_type="MARKET")
                     order_id = resp.get("OrderId", resp.get("Data", {}).get("OrderId", "mock_id"))
                     log_trade(

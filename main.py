@@ -84,18 +84,21 @@ def run_bot(mode: str = None):
 
             # --- MACRO LOOP: Portfolio Rebalance ---
             if (now - last_rebalance_time) >= rebalance_interval_sec:
-                logger.info(f"[TRIGGER] Executing scheduled {settings.REBALANCE_INTERVAL_HOURS}-hour portfolio rebalance...")
-                
-                # Check current balance
-                bal = client.get_balance()
-                decision = strategy.evaluate(snapshot, bal)
-                
-                logger.info(f"Strategy Decision Regime: {decision.regime}")
-                for pair, w in decision.target_weights.items():
-                    logger.info(f"  Target Allocation: {pair:<10} -> {w*100:5.1f}% | {decision.rationales.get(pair, '')}")
+                if risk_guard.circuit_breaker_active or risk_status.get("Status") == "COOLDOWN":
+                    logger.warning("[REBALANCE SUPPRESSED] Circuit breaker active in cooldown. Rebalance skipped.")
+                else:
+                    logger.info(f"[TRIGGER] Executing scheduled {settings.REBALANCE_INTERVAL_HOURS}-hour portfolio rebalance...")
+                    
+                    # Check current balance
+                    bal = client.get_balance()
+                    decision = strategy.evaluate(snapshot, bal)
+                    
+                    logger.info(f"Strategy Decision Regime: {decision.regime}")
+                    for pair, w in decision.target_weights.items():
+                        logger.info(f"  Target Allocation: {pair:<10} -> {w*100:5.1f}% | {decision.rationales.get(pair, '')}")
 
-                rebalancer.execute_rebalance(decision, snapshot.exchange_info)
-                last_rebalance_time = now
+                    rebalancer.execute_rebalance(decision, snapshot.exchange_info)
+                    last_rebalance_time = now
 
             # Sleep for micro risk check interval
             time.sleep(settings.RISK_CHECK_INTERVAL_SECONDS)

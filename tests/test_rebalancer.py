@@ -83,7 +83,9 @@ class TestRebalancer(unittest.TestCase):
             "BTC/USD": {"AmountPrecision": 4, "MiniOrder": 1.0}
         }
 
-        # New target is only -10% short ($1,000 collateral target vs $2,000 existing)
+        # Total portfolio equity = $10,000 Free USD + $2,000 Short Collateral = $12,000
+        # Target -10% short = $1,200 target collateral (vs $2,000 existing)
+        # Reduction delta = $800 ($800 / $2,000 = 40.0% close)
         decision = StrategyDecision(
             target_weights={"USD": 0.90, "BTC/USD": -0.10},
             regime="BEAR_CONTRACTION",
@@ -93,11 +95,11 @@ class TestRebalancer(unittest.TestCase):
 
         rebalancer.execute_rebalance(decision, exchange_info)
 
-        # Must have called short_close to scale down short by 50% ($1,000 reduction / $2,000 existing)
+        # Must have called short_close to scale down short by 40% ($800 reduction / $2,000 existing)
         mock_client.short_close.assert_called()
         call_kwargs = mock_client.short_close.call_args.kwargs
         self.assertEqual(call_kwargs["pair"], "BTC/USD")
-        self.assertAlmostEqual(call_kwargs["close_pct"], 50.0, places=1)
+        self.assertAlmostEqual(call_kwargs["close_pct"], 40.0, places=1)
 
 if __name__ == "__main__":
     unittest.main()

@@ -124,7 +124,7 @@ class TestDecisionEngine(unittest.TestCase):
         self.assertEqual(decision.regime, "BULL_EXPANSION")
         self.assertEqual(decision.target_weights["BTC/USD"], 0.20)  # 20% Anchor Core
         self.assertIn("ADA/USD", decision.target_weights)
-        self.assertGreaterEqual(decision.target_weights["ADA/USD"], 0.30)  # Overweighted small-cap
+        self.assertEqual(decision.target_weights["ADA/USD"], 0.20)  # Capped at MAX_ALTCOIN_ALLOCATION (20%)
         self.assertGreaterEqual(decision.target_weights["USD"], 0.20)      # 20% Cash Buffer
 
     def test_decision_engine_4_tier_and_cross_crypto_lag(self):

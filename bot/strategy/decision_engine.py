@@ -156,8 +156,10 @@ class DecisionEngine(BaseStrategy):
         # --- 1. Tier 1: Anchor Allocation (Mega-Cap Stability: BTC or ETH) ---
         eth_metric = snapshot.assets.get("ETHUSDT")
         anchor_pair = "BTC/USD"
-        if eth_metric and btc_metric and eth_metric.return_12h_pct > btc_metric.return_12h_pct and eth_metric.taker_buy_4h_pct > 50.0:
-            anchor_pair = "ETH/USD"
+        # Require absolute positive return (> 0.0%) so we never anchor to a bleeding asset
+        if eth_metric and btc_metric:
+            if eth_metric.return_12h_pct > btc_metric.return_12h_pct and eth_metric.return_12h_pct > 0.0 and eth_metric.taker_buy_4h_pct > 50.0:
+                anchor_pair = "ETH/USD"
 
         target_weights[anchor_pair] = round(anchor_budget, 3)
         rationales[anchor_pair] = f"Tier 1: Core Anchor ({anchor_budget*100:.0f}%) | Regime: {regime} | Mega-cap market presence."
@@ -173,11 +175,16 @@ class DecisionEngine(BaseStrategy):
             return (lag_bonus + alpha + orderflow) * price_pref
 
         def get_tier_name(sym: str) -> str:
-            if sym in settings.TIER_SMART_CONTRACTS:
+            # Robust normalization: handles SOL/USD, SOLUSDT, and raw SOL
+            clean_sym = sym.replace("/", "").replace("USD", "")
+            if not clean_sym.endswith("USDT"):
+                clean_sym = f"{clean_sym}USDT"
+
+            if clean_sym in settings.TIER_SMART_CONTRACTS or sym in settings.TIER_SMART_CONTRACTS:
                 return "TIER_SMART_CONTRACTS"
-            if sym in settings.TIER_INFRASTRUCTURE:
+            if clean_sym in settings.TIER_INFRASTRUCTURE or sym in settings.TIER_INFRASTRUCTURE:
                 return "TIER_INFRASTRUCTURE"
-            if sym in settings.TIER_SPECULATIVE:
+            if clean_sym in settings.TIER_SPECULATIVE or sym in settings.TIER_SPECULATIVE:
                 return "TIER_SPECULATIVE"
             return "TIER_SPECULATIVE"
 
@@ -228,10 +235,10 @@ class DecisionEngine(BaseStrategy):
         all_selected = list(selected_tier_assets.values())
 
         if len(all_selected) == 1:
-            # Concentrated single runner: allocate up to max single-asset allocation
+            # Concentrated single runner: cap at MAX_ALTCOIN_ALLOCATION (20%) to avoid fat-tail risk
             single_m = all_selected[0]
             ev = self.calculate_expected_value(single_m)
-            single_weight = 0.20 if regime == "SIDEWAYS_STABILITY" else min(0.35, satellite_budget)
+            single_weight = min(settings.MAX_ALTCOIN_ALLOCATION, satellite_budget)
             target_weights[single_m.roostoo_pair] = single_weight
             rationales[single_m.roostoo_pair] = (
                 f"{get_tier_name(single_m.symbol).replace('_', ' ').title()} ({single_weight*100:.1f}%) | "
@@ -241,12 +248,12 @@ class DecisionEngine(BaseStrategy):
             expected_returns[single_m.roostoo_pair] = ev
 
         elif len(all_selected) > 1:
-            # Multi-tier diversified basket: allocate based on tier weights
+            # Multi-tier diversified basket: allocate based on tier weights, capped at MAX_ALTCOIN_ALLOCATION
             total_budget_needed = sum(tier_budgets[t_key] for t_key in selected_tier_assets.keys())
             scale = min(1.0, satellite_budget / max(total_budget_needed, 1e-6))
             for t_key, m in selected_tier_assets.items():
                 ev = self.calculate_expected_value(m)
-                w = round(tier_budgets[t_key] * scale, 3)
+                w = min(settings.MAX_ALTCOIN_ALLOCATION, round(tier_budgets[t_key] * scale, 3))
                 if w >= 0.05:
                     target_weights[m.roostoo_pair] = w
                     rationales[m.roostoo_pair] = (

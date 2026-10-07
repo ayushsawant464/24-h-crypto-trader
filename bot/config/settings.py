@@ -63,7 +63,8 @@ class Settings:
     EARLY_MOMENTUM_DECAY_PCT: float = 1.20              # Cut deteriorating positions before full 3.5% stop
     
     # Portfolio Allocation Constraints
-    MAX_ALLOCATION_PER_ASSET: float = 0.40      # Max 40% for any single asset
+    MAX_ALLOCATION_PER_ASSET: float = 0.40      # Max 40% for BTC Anchor Core
+    MAX_ALTCOIN_ALLOCATION: float = 0.20        # Max 20% for any single altcoin (fat-tail defense)
     MAX_TOTAL_INVESTED: float = 0.80            # Max 80% total exposure
     MIN_CASH_BUFFER: float = 0.20               # Keep 20% in USD Cash Buffer
     
