@@ -268,6 +268,32 @@ class DecisionEngine(BaseStrategy):
                 "TIER_SPECULATIVE": settings.SIDEWAYS_SPECULATIVE_WEIGHT           # 3%
             }
 
+        # Check Bull Conditional Tail-Hedge Triggers (distribution / volatility shock)
+        bull_tail_hedge_active = False
+        bull_hedge_reasons: List[str] = []
+
+        if regime == "BULL_EXPANSION" and settings.ENABLE_BULL_CONDITIONAL_HEDGE:
+            # 1. Whale Distribution Filter: BTC taker buying collapses below threshold despite bull regime
+            if snapshot.btc_taker_buy_pct < settings.BULL_HEDGE_TRIGGER_TAKER_BUY:
+                bull_tail_hedge_active = True
+                bull_hedge_reasons.append(f"BTC TakerBuy {snapshot.btc_taker_buy_pct:.1f}% < {settings.BULL_HEDGE_TRIGGER_TAKER_BUY}%")
+
+            # 2. Volatility Turbulence / ATR Shock: Sudden volatility spike at resistance
+            if settings.BULL_HEDGE_TRIGGER_ATR_EXPANSION and not snapshot.btc_atr_normal:
+                bull_tail_hedge_active = True
+                bull_hedge_reasons.append("BTC ATR Volatility Shock")
+
+            # 3. Altcoin Dispersion Breakdown: Altcoins failing to follow BTC
+            liquid_alt_alphas = [
+                m.residual_alpha_pct for sym, m in snapshot.assets.items()
+                if sym != "BTCUSDT" and m.is_liquid
+            ]
+            if liquid_alt_alphas:
+                avg_alt_alpha = sum(liquid_alt_alphas) / len(liquid_alt_alphas)
+                if avg_alt_alpha < settings.BULL_HEDGE_TRIGGER_ALT_DIVERGENCE:
+                    bull_tail_hedge_active = True
+                    bull_hedge_reasons.append(f"Altcoin Divergence (Avg Alpha: {avg_alt_alpha:+.2f}%)")
+
         # --- 1. Tier 1: Anchor Allocation (Mega-Cap Stability: BTC or ETH) ---
         eth_metric = snapshot.assets.get("ETHUSDT")
         anchor_pair = "BTC/USD"
@@ -276,24 +302,47 @@ class DecisionEngine(BaseStrategy):
             if eth_metric.return_12h_pct > btc_metric.return_12h_pct and eth_metric.return_12h_pct > 0.0 and eth_metric.taker_buy_4h_pct > 50.0:
                 anchor_pair = "ETH/USD"
 
-        # Anchor Quarantine Check: Fallback to alternate mega-cap or USD cash if quarantined
-        if self.state_store and self.state_store.is_quarantined(anchor_pair):
-            alt_pair = "ETH/USD" if anchor_pair == "BTC/USD" else "BTC/USD"
-            if not self.state_store.is_quarantined(alt_pair):
-                logger.info(f"[DECISION ENGINE] Anchor {anchor_pair} quarantined. Switching anchor to {alt_pair}.")
-                anchor_pair = alt_pair
-                target_weights[anchor_pair] = round(anchor_budget, 3)
-                rationales[anchor_pair] = f"Tier 1: Core Anchor ({anchor_budget*100:.0f}%) | Alternate anchor ({anchor_pair}) selected due to quarantine."
-                expected_returns[anchor_pair] = 0.50
+        if bull_tail_hedge_active:
+            # When Bull Tail-Hedge is active, avoid long BTC due to detected distribution.
+            # If ETH is showing genuine positive momentum and accumulation, retain a de-risked 10% anchor.
+            if eth_metric and eth_metric.return_12h_pct > 0.0 and eth_metric.taker_buy_4h_pct > 50.0 and not (self.state_store and self.state_store.is_quarantined("ETH/USD")):
+                target_weights["ETH/USD"] = 0.10
+                rationales["ETH/USD"] = "Tier 1: Core Anchor (10.0%) | Bull Tail-Hedge Active: De-risked ETH anchor."
+                expected_returns["ETH/USD"] = 0.50
             else:
-                logger.info(f"[DECISION ENGINE] Both BTC and ETH quarantined. Allocating anchor budget {anchor_budget*100:.0f}% to USD Cash.")
+                logger.info(f"[DECISION ENGINE] Bull Tail-Hedge active ({', '.join(bull_hedge_reasons)}). Anchor budget parked in USD Cash.")
                 target_weights["USD"] = target_weights.get("USD", 0.0) + anchor_budget
-                rationales["USD"] = f"Anchor Quarantine Defense: Both BTC and ETH quarantined. Parking {anchor_budget*100:.0f}% in USD Cash."
+                rationales["USD"] = f"Bull Tail-Hedge Defense: Anchor budget parked in Cash due to {', '.join(bull_hedge_reasons)}."
                 expected_returns["USD"] = 0.0
+
+            # Macro Short BTC Tail-Hedge:
+            if settings.ENABLE_SHORTING:
+                hedge_w = settings.BULL_CONDITIONAL_SHORT_HEDGE_WEIGHT
+                target_weights["BTC/USD"] = -hedge_w
+                rationales["BTC/USD"] = (
+                    f"Bull Conditional Tail-Hedge: -{hedge_w*100:.1f}% 1x Short BTC protecting portfolio "
+                    f"against {', '.join(bull_hedge_reasons)}."
+                )
+                expected_returns["BTC/USD"] = 1.20
         else:
-            target_weights[anchor_pair] = round(anchor_budget, 3)
-            rationales[anchor_pair] = f"Tier 1: Core Anchor ({anchor_budget*100:.0f}%) | Regime: {regime} | Mega-cap market presence."
-            expected_returns[anchor_pair] = 0.50
+            # Anchor Quarantine Check: Fallback to alternate mega-cap or USD cash if quarantined
+            if self.state_store and self.state_store.is_quarantined(anchor_pair):
+                alt_pair = "ETH/USD" if anchor_pair == "BTC/USD" else "BTC/USD"
+                if not self.state_store.is_quarantined(alt_pair):
+                    logger.info(f"[DECISION ENGINE] Anchor {anchor_pair} quarantined. Switching anchor to {alt_pair}.")
+                    anchor_pair = alt_pair
+                    target_weights[anchor_pair] = round(anchor_budget, 3)
+                    rationales[anchor_pair] = f"Tier 1: Core Anchor ({anchor_budget*100:.0f}%) | Alternate anchor ({anchor_pair}) selected due to quarantine."
+                    expected_returns[anchor_pair] = 0.50
+                else:
+                    logger.info(f"[DECISION ENGINE] Both BTC and ETH quarantined. Allocating anchor budget {anchor_budget*100:.0f}% to USD Cash.")
+                    target_weights["USD"] = target_weights.get("USD", 0.0) + anchor_budget
+                    rationales["USD"] = f"Anchor Quarantine Defense: Both BTC and ETH quarantined. Parking {anchor_budget*100:.0f}% in USD Cash."
+                    expected_returns["USD"] = 0.0
+            else:
+                target_weights[anchor_pair] = round(anchor_budget, 3)
+                rationales[anchor_pair] = f"Tier 1: Core Anchor ({anchor_budget*100:.0f}%) | Regime: {regime} | Mega-cap market presence."
+                expected_returns[anchor_pair] = 0.50
 
         # --- 2. Screen & Rank Candidates Across Satellite Tiers ---
         # Helper to score candidates combining Lag Spread (catch-up bonus), Alpha, and Taker Flow
@@ -387,9 +436,14 @@ class DecisionEngine(BaseStrategy):
         # --- 3. Target Weight Normalization & Cash Buffer Allocation ---
         # Encumbered capital (spot longs + short collateral) must be summed by absolute value
         allocated_so_far = sum(abs(w) for k, w in target_weights.items() if k != "USD")
-        max_non_cash = round(1.0 - settings.MIN_CASH_BUFFER, 4)
+        effective_min_cash = (
+            settings.BULL_CONDITIONAL_CASH_BUFFER 
+            if (regime == "BULL_EXPANSION" and bull_tail_hedge_active) 
+            else settings.MIN_CASH_BUFFER
+        )
+        max_non_cash = round(1.0 - effective_min_cash, 4)
         
-        # Guard against portfolio budget overrun (> 80% non-cash):
+        # Guard against portfolio budget overrun (> max_non_cash):
         if allocated_so_far > max_non_cash and allocated_so_far > 0:
             scale = max_non_cash / allocated_so_far
             for k in list(target_weights.keys()):
@@ -397,9 +451,12 @@ class DecisionEngine(BaseStrategy):
                     target_weights[k] = round(target_weights[k] * scale, 3)
             allocated_so_far = sum(abs(w) for k, w in target_weights.items() if k != "USD")
 
-        cash_weight = max(settings.MIN_CASH_BUFFER, round(1.0 - allocated_so_far, 3))
+        cash_weight = max(effective_min_cash, round(1.0 - allocated_so_far, 3))
         target_weights["USD"] = cash_weight
-        rationales["USD"] = f"Liquid Cash Buffer ({cash_weight*100:.1f}%) preserving capital and absorbing trading fees."
+        if bull_tail_hedge_active:
+            rationales["USD"] = f"Elevated Cash Buffer ({cash_weight*100:.1f}%) protecting capital during Bull Tail-Hedge ({', '.join(bull_hedge_reasons)})."
+        else:
+            rationales["USD"] = f"Liquid Cash Buffer ({cash_weight*100:.1f}%) preserving capital and absorbing trading fees."
         expected_returns["USD"] = 0.0
 
         return StrategyDecision(

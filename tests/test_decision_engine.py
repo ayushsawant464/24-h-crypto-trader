@@ -320,5 +320,53 @@ class TestDecisionEngine(unittest.TestCase):
         self.assertIn("USD", decision.target_weights)
         self.assertGreaterEqual(decision.target_weights["USD"], 0.35)
 
+    def test_decision_engine_bull_conditional_hedge(self):
+        """
+        Validates that in a Bull Expansion where BTC shows whale distribution
+        (BTC taker buy falls below 48%), the bot activates a conditional 10% Short BTC tail-hedge
+        and elevates the cash buffer to >= 30% while retaining resilient altcoin runners.
+        """
+        engine = DecisionEngine()
+
+        btc_metric = AssetMetrics(
+            symbol="BTCUSDT", roostoo_pair="BTC/USD", last_price=86000.0, spread_pct=0.001,
+            volume_24h_usd=1_000_000_000.0, return_12h_pct=2.5, return_4h_pct=1.5, return_15m_pct=0.2,
+            taker_buy_4h_pct=46.0, taker_imbalance_15m=-0.05, vol_zscore_15m=0.5, atr_15m_pct=0.4,
+            beta_to_btc=1.0, residual_alpha_pct=0.0, is_liquid=True, lag_spread_4h_pct=0.0
+        )
+
+        sui_metric = AssetMetrics(
+            symbol="SUIUSDT", roostoo_pair="SUI/USD", last_price=2.10, spread_pct=0.012,
+            volume_24h_usd=60_000_000.0, return_12h_pct=4.5, return_4h_pct=2.0, return_15m_pct=0.3,
+            taker_buy_4h_pct=54.0, taker_imbalance_15m=0.15, vol_zscore_15m=0.8, atr_15m_pct=0.9,
+            beta_to_btc=1.3, residual_alpha_pct=1.25, is_liquid=True, lag_spread_4h_pct=1.2
+        )
+
+        snapshot = MarketSnapshot(
+            timestamp=1000000.0,
+            btc_above_ema20=True,
+            btc_taker_buy_pct=46.0,  # Warning: Whale distribution (< 48.0%)
+            btc_atr_normal=True,
+            assets={"BTCUSDT": btc_metric, "SUIUSDT": sui_metric},
+            exchange_info={}
+        )
+
+        decision = engine.evaluate(snapshot, portfolio_state={})
+        self.assertEqual(decision.regime, "BULL_EXPANSION")
+
+        # 1. Macro Short BTC Tail-Hedge activated
+        self.assertIn("BTC/USD", decision.target_weights)
+        self.assertEqual(decision.target_weights["BTC/USD"], -0.10)
+        self.assertIn("Bull Conditional Tail-Hedge", decision.rationales["BTC/USD"])
+
+        # 2. Resilient runner SUI is still held
+        self.assertIn("SUI/USD", decision.target_weights)
+        self.assertGreater(decision.target_weights["SUI/USD"], 0.0)
+
+        # 3. Cash buffer is elevated to >= 30%
+        self.assertIn("USD", decision.target_weights)
+        self.assertGreaterEqual(decision.target_weights["USD"], 0.30)
+        self.assertIn("Elevated Cash Buffer", decision.rationales["USD"])
+
 if __name__ == "__main__":
     unittest.main()

@@ -90,6 +90,14 @@ class Settings:
     BULL_SPECULATIVE_WEIGHT: float = 0.10       # Tier 4: High-Beta Retail Plays
     BULL_CASH_WEIGHT: float = 0.20              # 20% Free USD Cash Buffer
 
+    # Bull Market Conditional Tail-Hedge Settings
+    ENABLE_BULL_CONDITIONAL_HEDGE: bool = True
+    BULL_HEDGE_TRIGGER_TAKER_BUY: float = 48.0       # Trigger: BTC taker buy < 48% signals whale distribution
+    BULL_HEDGE_TRIGGER_ATR_EXPANSION: bool = True     # Trigger: BTC ATR surge/volatility shock
+    BULL_HEDGE_TRIGGER_ALT_DIVERGENCE: float = -0.80 # Trigger: Average altcoin residual alpha < -0.80%
+    BULL_CONDITIONAL_SHORT_HEDGE_WEIGHT: float = 0.10 # 10% Short BTC tail-hedge when warning lights fire
+    BULL_CONDITIONAL_CASH_BUFFER: float = 0.30       # Elevate cash buffer to 30% during distribution warning
+
     # Bear Market Regime Weights (Hedged Cross-Sectional Alpha & Partition Rebalancing)
     BEAR_CASH_WEIGHT: float = 0.90              # Fallback 90% Cash Bunker when no partition alpha exists
     BEAR_GOLD_WEIGHT: float = 0.00              # 0.0% PAXG/USD (Eliminated: Roostoo mock exchange has no gold pairs)
