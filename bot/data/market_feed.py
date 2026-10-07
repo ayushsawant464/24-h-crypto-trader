@@ -143,9 +143,18 @@ class MarketFeed:
                 ret_15m = (df_15m['close'].iloc[-1] - df_15m['open'].iloc[-1]) / df_15m['open'].iloc[-1] * 100
                 net_tb = df_15m['tb_quote'].iloc[-1] - (df_15m['quote_volume'].iloc[-1] - df_15m['tb_quote'].iloc[-1])
                 tb_imbalance_15m = net_tb / max(df_15m['quote_volume'].iloc[-1], 1e-9)
-                vol_mean = df_15m['quote_volume'].rolling(20).mean().iloc[-1]
-                vol_std = df_15m['quote_volume'].rolling(20).std().iloc[-1]
-                vol_z = (df_15m['quote_volume'].iloc[-1] - vol_mean) / max(vol_std, 1e-6)
+                # Prorate current forming candle volume by elapsed time & check last completed candle
+                vol_series = df_15m['quote_volume'].iloc[:-1] if len(df_15m) > 20 else df_15m['quote_volume']
+                vol_mean = vol_series.rolling(min(20, len(vol_series))).mean().iloc[-1]
+                vol_std = vol_series.rolling(min(20, len(vol_series))).std().iloc[-1]
+
+                vol_z_completed = (df_15m['quote_volume'].iloc[-2] - vol_mean) / max(vol_std, 1e-6) if len(df_15m) >= 2 else 0.0
+                curr_open_time = df_15m['open_time'].iloc[-1] / 1000.0 if 'open_time' in df_15m.columns else time.time()
+                elapsed_sec = min(900.0, max(45.0, time.time() - curr_open_time))
+                projected_vol = df_15m['quote_volume'].iloc[-1] * (900.0 / elapsed_sec)
+                vol_z_forming = (projected_vol - vol_mean) / max(vol_std, 1e-6)
+
+                vol_z = max(vol_z_completed, vol_z_forming)
 
                 tr = np.maximum(
                     df_15m['high'] - df_15m['low'],
@@ -156,9 +165,23 @@ class MarketFeed:
                 )
                 atr_15m_pct = (tr.rolling(14).mean().iloc[-1] / df_15m['close'].iloc[-1]) * 100
 
-            # Beta & Residual Alpha vs BTC
+            # Beta & Residual Alpha vs BTC (strictly aligned by timestamp open_time)
             beta = 1.0
-            if not btc_1h.empty and len(btc_1h) >= 24:
+            if not btc_1h.empty and not df_1h.empty and 'open_time' in df_1h.columns and 'open_time' in btc_1h.columns:
+                merged = pd.merge(
+                    df_1h[['open_time', 'close']].rename(columns={'close': 'alt_close'}),
+                    btc_1h[['open_time', 'close']].rename(columns={'close': 'btc_close'}),
+                    on='open_time'
+                ).sort_values('open_time')
+                if len(merged) >= 20:
+                    alt_rets = merged['alt_close'].pct_change().dropna().iloc[-24:]
+                    b_rets = merged['btc_close'].pct_change().dropna().iloc[-24:]
+                    if len(alt_rets) >= 12 and len(alt_rets) == len(b_rets):
+                        var_b = np.var(b_rets)
+                        if var_b > 1e-12:
+                            cov = np.cov(alt_rets, b_rets)[0, 1]
+                            beta = round(float(cov / var_b), 3)
+            elif not btc_1h.empty and len(btc_1h) >= 24 and not df_1h.empty and len(df_1h) >= 24:
                 alt_rets = df_1h['close'].pct_change().dropna().iloc[-24:]
                 b_rets = btc_1h['close'].pct_change().dropna().iloc[-24:]
                 if len(alt_rets) == len(b_rets):

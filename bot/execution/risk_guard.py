@@ -1,3 +1,4 @@
+import math
 import time
 from typing import Dict, Any, Optional
 from dataclasses import dataclass
@@ -5,6 +6,13 @@ from bot.config.settings import settings
 from bot.data.roostoo_client import RoostooClient
 from bot.data.market_feed import MarketSnapshot
 from bot.logs.logger import logger, log_trade
+
+def floor_to_precision(val: float, precision: int) -> float:
+    """Floors quantity down to precision to prevent Insufficient Balance errors."""
+    if precision <= 0:
+        return float(math.floor(val))
+    factor = 10 ** precision
+    return math.floor(val * factor) / factor
 
 @dataclass
 class PositionTracker:
@@ -127,7 +135,21 @@ class RiskGuard:
                 return {"Status": "COOLDOWN", "RemainingSeconds": int(self.circuit_breaker_until - now)}
             else:
                 self.circuit_breaker_active = False
-                logger.info("[CIRCUIT BREAKER EXPIRED] Resuming standard operations.")
+                # CRITICAL FIX: Reset high watermark to current portfolio value after cooldown.
+                # Without this, the drawdown from the old HWM would immediately re-trigger
+                # the circuit breaker in an infinite 4-hour death spiral.
+                ticker_resp_reset = self.roostoo.get_ticker()
+                tickers_reset = ticker_resp_reset.get("Data", {})
+                bal_reset = self.roostoo.get_balance()
+                wallet_reset = bal_reset.get("Wallet", {})
+                reset_val = float(wallet_reset.get("USD", {}).get("Free", 0.0)) + float(wallet_reset.get("USD", {}).get("Lock", 0.0))
+                for coin, val in wallet_reset.items():
+                    if coin != "USD":
+                        qty = float(val.get("Free", 0.0)) + float(val.get("Lock", 0.0))
+                        p = tickers_reset.get(f"{coin}/USD", {}).get("LastPrice", 0.0)
+                        reset_val += (qty * p)
+                self.portfolio_high_watermark = reset_val
+                logger.info(f"[CIRCUIT BREAKER EXPIRED] Resuming operations. HWM reset to ${reset_val:,.2f}")
 
         ticker_resp = self.roostoo.get_ticker()
         tickers = ticker_resp.get("Data", {})
@@ -271,7 +293,7 @@ class RiskGuard:
 
     def _execute_stop_sell(self, pair: str, pos: PositionTracker, price: float, exchange_info: Dict[str, Any], reason: str):
         amt_prec = exchange_info.get(pair, {}).get("AmountPrecision", 4)
-        sell_qty = round(pos.quantity, amt_prec)
+        sell_qty = floor_to_precision(pos.quantity, amt_prec)
         resp = self.roostoo.place_order(pair=pair, side="SELL", quantity=sell_qty, order_type="MARKET")
         order_id = resp.get("OrderId", resp.get("Data", {}).get("OrderId", "mock_id"))
         pnl_pct = (price - pos.entry_price) / pos.entry_price * 100.0

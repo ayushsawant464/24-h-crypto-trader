@@ -24,8 +24,12 @@ class DecisionEngine(BaseStrategy):
         p_win = min(0.75, max(0.40, 0.50 + 0.50 * (tb_fraction - 0.50)))
         p_loss = 1.0 - p_win
 
-        target_win_pct = 4.0
-        target_loss_pct = 2.0
+        # Volatility-adjusted target win/loss based on asset ATR:
+        # Standard swing targets are 4.0% win and 2.0% loss (matching Trailing Stop and Ratchet triggers).
+        # For high-volatility assets (e.g. meme coins), targets scale up proportionally.
+        vol_scale = max(1.0, metric.atr_15m_pct / 0.8) if metric.atr_15m_pct > 0 else 1.0
+        target_win_pct = 4.0 * vol_scale
+        target_loss_pct = 2.0 * vol_scale
 
         ev_net = (p_win * target_win_pct) - (p_loss * target_loss_pct) - self.friction_pct
         return round(ev_net, 3)
@@ -221,7 +225,8 @@ class DecisionEngine(BaseStrategy):
                     expected_returns[m.roostoo_pair] = ev
 
         # --- 3. Cash Buffer Allocation ---
-        allocated_so_far = sum(w for k, w in target_weights.items() if k != "USD")
+        # Encumbered capital (spot longs + short collateral) must be summed by absolute value
+        allocated_so_far = sum(abs(w) for k, w in target_weights.items() if k != "USD")
         cash_weight = max(settings.MIN_CASH_BUFFER, round(1.0 - allocated_so_far, 3))
         target_weights["USD"] = cash_weight
         rationales["USD"] = f"Liquid Cash Buffer ({cash_weight*100:.1f}%) preserving capital and absorbing trading fees."
