@@ -12,6 +12,7 @@ from bot.config.settings import settings
 from bot.logs.logger import logger
 from bot.data.roostoo_client import RoostooClient
 from bot.data.market_feed import MarketFeed
+from bot.data.state_store import StateStore
 from bot.strategy.decision_engine import DecisionEngine
 from bot.execution.rebalancer import PortfolioRebalancer
 from bot.execution.risk_guard import RiskGuard
@@ -54,10 +55,11 @@ def run_bot(mode: str = None):
     logger.info(f"Connected to Roostoo Mock Exchange. ServerTime: {server_time_resp.get('ServerTime')}")
 
     # 2. Components Initialization
+    state_store = StateStore()
     feed = MarketFeed(client)
-    strategy = DecisionEngine()
+    strategy = DecisionEngine(state_store)
     rebalancer = PortfolioRebalancer(client)
-    risk_guard = RiskGuard(client)
+    risk_guard = RiskGuard(client, state_store)
 
     ex_info = feed.get_exchange_info()
     logger.info(f"Loaded {len(ex_info)} trading pairs from Roostoo ExchangeInfo.")

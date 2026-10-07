@@ -110,11 +110,12 @@ class PortfolioRebalancer:
             prec_info = exchange_info.get(pair, {})
             amt_prec = prec_info.get("AmountPrecision", 4)
             mini_order = prec_info.get("MiniOrder", 1.0)
+            deadband_usd = total_val * (settings.REBALANCE_DEADBAND_PCT / 100.0)
 
-            # Eliminate dust accumulation:
+            # Eliminate dust accumulation and enforce hysteresis deadband:
             # - If target_w == 0 (demoted/liquidated), liquidate 100% down to mini_order
-            # - If target_w > 0, rebalance if delta exceeds mini_order
-            should_sell = (target_w == 0.0 and curr_usd >= mini_order) or (delta_usd < -max(mini_order, 5.0))
+            # - If target_w > 0, rebalance only if allocation deviation exceeds the 2.5% deadband
+            should_sell = (target_w == 0.0 and curr_usd >= mini_order) or (target_w > 0.0 and delta_usd < -max(mini_order, deadband_usd))
 
             if should_sell:
                 curr_free = free_holdings.get(pair, 0.0)
@@ -205,8 +206,9 @@ class PortfolioRebalancer:
                 target_short_collateral = total_val * abs(target_w)
                 existing_collateral = active_shorts_map.get(pair, 0.0)
                 collateral_delta = target_short_collateral - existing_collateral
+                deadband_usd = total_val * (settings.REBALANCE_DEADBAND_PCT / 100.0)
 
-                if collateral_delta >= 25.0:
+                if collateral_delta >= max(25.0, deadband_usd):
                     logger.info(
                         f"Rebalance SHORT OPEN: {pair} collateral delta ${collateral_delta:.2f} "
                         f"(Target: ${target_short_collateral:.2f}, Existing: ${existing_collateral:.2f})"
@@ -224,7 +226,7 @@ class PortfolioRebalancer:
                         strategy_state={"regime": decision.regime, "target_weight": target_w}
                     )
                     time.sleep(0.3)
-                elif collateral_delta < -25.0 and existing_collateral > 0:
+                elif collateral_delta < -max(25.0, deadband_usd) and existing_collateral > 0:
                     # Scale down short when target short weight was reduced
                     reduce_collateral = abs(collateral_delta)
                     close_pct = min(100.0, (reduce_collateral / existing_collateral) * 100.0)
@@ -270,9 +272,10 @@ class PortfolioRebalancer:
             prec_info = exchange_info.get(pair, {})
             amt_prec = prec_info.get("AmountPrecision", 4)
             mini_order = prec_info.get("MiniOrder", 1.0)
+            deadband_usd = total_val * (settings.REBALANCE_DEADBAND_PCT / 100.0)
 
-            # If we need to buy (delta_usd > mini_order)
-            if delta_usd >= max(mini_order, 5.0) and avail_free_usd >= mini_order:
+            # If we need to buy (delta_usd exceeds mini_order and hysteresis deadband)
+            if delta_usd >= max(mini_order, deadband_usd) and avail_free_usd >= mini_order:
                 # Cap buy by actual free USD cash available with a 0.5% buffer for trading fees
                 effective_buy_usd = min(delta_usd, avail_free_usd * 0.995)
                 buy_qty = effective_buy_usd / curr_price

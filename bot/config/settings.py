@@ -77,9 +77,9 @@ class Settings:
     # Baseline / Sideways Regime Weights (Anchor 60% : Satellite 20% : Cash 20%)
     SIDEWAYS_ANCHOR_WEIGHT: float = 0.60        # 60% Anchor Core (BTC)
     SIDEWAYS_SATELLITE_WEIGHT: float = 0.20     # 20% Total Satellite Budget
-    SIDEWAYS_SMART_CONTRACTS_WEIGHT: float = 0.15 # Tier 2: Smart Contract Platforms
+    SIDEWAYS_SMART_CONTRACTS_WEIGHT: float = 0.12 # Tier 2: Smart Contract Platforms
     SIDEWAYS_INFRASTRUCTURE_WEIGHT: float = 0.05  # Tier 3: Infrastructure & AI
-    SIDEWAYS_SPECULATIVE_WEIGHT: float = 0.00    # Tier 4: Speculative minimized in sideways
+    SIDEWAYS_SPECULATIVE_WEIGHT: float = 0.03    # Tier 4: Speculative minimized in sideways
     SIDEWAYS_CASH_WEIGHT: float = 0.20          # 20% Free USD Cash Buffer
 
     # Bull Expansion Regime Weights (Anchor 20% : Satellites 60% : Cash 20%)
@@ -99,7 +99,9 @@ class Settings:
     SHORT_STOP_LOSS_PCT: float = 2.5            # Tighter stop-loss for short positions (2.5%)
     
     # Risk Management & Stop Limits
-    HARD_STOP_LOSS_PCT: float = 3.5             # 3.5% initial spot stop-loss
+    HARD_STOP_LOSS_PCT: float = 3.5             # 3.5% baseline spot stop-loss
+    DYNAMIC_ATR_MULTIPLIER: float = 2.2         # 2.2x 15m ATR for adaptive volatility stop
+    MAX_ATR_STOP_LOSS_PCT: float = 4.5          # 4.5% hard cap on dynamic stop-loss
     PROFIT_RATCHET_TRIGGER_PCT: float = 2.0     # When profit >= +2.0%
     PROFIT_RATCHET_LOCK_PCT: float = 0.40       # Lock stop to +0.40% (covers 0.2% fees)
     TRAILING_STOP_TRIGGER_PCT: float = 4.0      # When profit >= +4.0%
@@ -107,6 +109,11 @@ class Settings:
     PORTFOLIO_CIRCUIT_BREAKER_PCT: float = 2.0  # Max 2% total drawdown -> 100% Cash
     CIRCUIT_BREAKER_COOLDOWN_HOURS: int = 4
     
+    # Rebalance Execution & Hysteresis Defense
+    REBALANCE_DEADBAND_PCT: float = 2.5         # 2.5% allocation deadband to prevent churn/overtrading
+    QUARANTINE_DURATION_HOURS: float = 12.0     # 12-hour cooloff after stop-loss execution
+    MAX_CONCURRENT_LIQUIDATION_WORKERS: int = 2 # Worker throttle to prevent HTTP 429 rate limit bans
+
     # Logging
     LOGS_DIR: Path = PROJECT_ROOT / "logs"
 

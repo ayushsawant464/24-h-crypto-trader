@@ -38,17 +38,74 @@ class RiskGuard:
     - Trailing Profit Lock (+4.0% -> Peak - 1.2%)
     - Order Flow Toxicity Emergency Exit / Squeeze Avoidance
     - Portfolio Circuit Breaker (2.0% Drawdown -> 100% Cash)
+    - State Persistence & Anti-Amnesia across restarts
     """
-    def __init__(self, roostoo_client: RoostooClient):
+    def __init__(self, roostoo_client: RoostooClient, state_store: Optional[Any] = None):
         self.roostoo = roostoo_client
         self.active_positions: Dict[str, PositionTracker] = {}
         self.portfolio_high_watermark: float = 0.0  # Initialized dynamically on first audit
         self.circuit_breaker_active: bool = False
         self.circuit_breaker_until: float = 0.0
 
-    def update_positions_from_wallet(self, tickers: Dict[str, Any], exchange_info: Dict[str, Any]):
+        if state_store is None:
+            try:
+                from bot.data.state_store import StateStore
+                self.state_store = StateStore()
+            except Exception:
+                self.state_store = None
+        else:
+            self.state_store = state_store
+
+        # Restore circuit breaker state if persisted
+        if self.state_store:
+            try:
+                hwm, cb_active, cb_until = self.state_store.load_circuit_breaker()
+                if hwm > 0:
+                    self.portfolio_high_watermark = hwm
+                self.circuit_breaker_active = cb_active
+                self.circuit_breaker_until = cb_until
+
+                # Restore persisted positions to eliminate stop-loss drift
+                persisted = self.state_store.load_positions()
+                for p_pair, p_pos in persisted.items():
+                    self.active_positions[p_pair] = PositionTracker(
+                        pair=p_pos.pair,
+                        entry_price=p_pos.entry_price,
+                        peak_price=p_pos.peak_price,
+                        quantity=p_pos.quantity,
+                        effective_stop_price=p_pos.effective_stop_price,
+                        is_ratcheted=p_pos.is_ratcheted,
+                        is_trailing=p_pos.is_trailing,
+                        side=p_pos.side
+                    )
+                if persisted:
+                    logger.info(f"[RISK GUARD] Restored {len(persisted)} active positions from SQLite state store.")
+            except Exception as e:
+                logger.debug(f"Note: Error restoring state in RiskGuard: {e}")
+
+    def _persist_position(self, pos: PositionTracker, atr_15m: float = 0.0):
+        if self.state_store:
+            try:
+                from bot.data.state_store import PersistedPosition
+                self.state_store.save_position(PersistedPosition(
+                    pair=pos.pair if pos.side == "LONG" else f"SHORT_{pos.pair}",
+                    side=pos.side,
+                    entry_price=pos.entry_price,
+                    peak_price=pos.peak_price,
+                    quantity=pos.quantity,
+                    effective_stop_price=pos.effective_stop_price,
+                    is_ratcheted=pos.is_ratcheted,
+                    is_trailing=pos.is_trailing,
+                    atr_15m=atr_15m,
+                    updated_at=time.time()
+                ))
+            except Exception as e:
+                logger.debug(f"Note: Error persisting position {pos.pair}: {e}")
+
+    def update_positions_from_wallet(self, tickers: Dict[str, Any], exchange_info: Dict[str, Any], snapshot: Optional[MarketSnapshot] = None):
         """
         Synchronizes active position tracking with Roostoo wallet and short positions.
+        Uses adaptive ATR stops and preserves historical entry prices across restarts.
         """
         balance_resp = self.roostoo.get_balance()
         wallet = balance_resp.get("Wallet", {})
@@ -66,8 +123,16 @@ class RiskGuard:
                 current_pairs.add(pair)
                 if pair not in self.active_positions:
                     # New spot long position detected
-                    stop_p = price * (1.0 - settings.HARD_STOP_LOSS_PCT / 100.0)
-                    self.active_positions[pair] = PositionTracker(
+                    # Adaptive ATR Stop-Loss: max(3.0%, 2.2 * ATR_15m) capped at MAX_ATR_STOP_LOSS_PCT (4.5%)
+                    sym = f"{coin}USDT"
+                    metric = snapshot.assets.get(sym) if snapshot else None
+                    atr_pct = metric.atr_15m_pct if (metric and metric.atr_15m_pct > 0) else 1.0
+                    dynamic_stop_pct = min(
+                        settings.MAX_ATR_STOP_LOSS_PCT,
+                        max(settings.HARD_STOP_LOSS_PCT, settings.DYNAMIC_ATR_MULTIPLIER * atr_pct)
+                    )
+                    stop_p = price * (1.0 - dynamic_stop_pct / 100.0)
+                    new_pos = PositionTracker(
                         pair=pair,
                         entry_price=price,
                         peak_price=price,
@@ -77,13 +142,19 @@ class RiskGuard:
                         is_trailing=False,
                         side="LONG"
                     )
-                    logger.info(f"[RISK GUARD] Tracking new LONG position: {pair} @ ${price:,.4f} | Stop: ${stop_p:,.4f}")
+                    self.active_positions[pair] = new_pos
+                    self._persist_position(new_pos, atr_15m=atr_pct)
+                    logger.info(
+                        f"[RISK GUARD] Tracking new LONG position: {pair} @ ${price:,.4f} | "
+                        f"Dynamic Stop ({dynamic_stop_pct:.2f}%): ${stop_p:,.4f}"
+                    )
                 else:
-                    # Update quantity and peak
+                    # Update quantity and peak (entry price and initial stop remain firmly anchored!)
                     pos = self.active_positions[pair]
                     pos.quantity = tot_qty
                     if price > pos.peak_price and pos.side == "LONG":
                         pos.peak_price = price
+                        self._persist_position(pos)
 
         # Also synchronize active short positions from /v6/short_positions
         try:
@@ -115,7 +186,7 @@ class RiskGuard:
 
                     if key not in self.active_positions and sentry > 0:
                         stop_p = sentry * (1.0 + settings.SHORT_STOP_LOSS_PCT / 100.0)
-                        self.active_positions[key] = PositionTracker(
+                        new_pos = PositionTracker(
                             pair=spair,
                             entry_price=sentry,
                             peak_price=sprice,
@@ -125,12 +196,15 @@ class RiskGuard:
                             is_trailing=False,
                             side="SHORT"
                         )
+                        self.active_positions[key] = new_pos
+                        self._persist_position(new_pos)
                         logger.info(f"[RISK GUARD] Tracking new SHORT position: {spair} @ ${sentry:,.4f} | Stop: ${stop_p:,.4f}")
                     elif key in self.active_positions:
                         pos = self.active_positions[key]
                         pos.quantity = sqty
                         if sprice < pos.peak_price:  # Track lowest price for short
                             pos.peak_price = sprice
+                            self._persist_position(pos)
         except Exception as e:
             logger.debug(f"Note: Error checking short positions in risk guard: {e}")
 
@@ -139,6 +213,8 @@ class RiskGuard:
             if p not in current_pairs:
                 logger.info(f"[RISK GUARD] Position closed: {p}")
                 del self.active_positions[p]
+                if self.state_store:
+                    self.state_store.remove_position(p)
 
     def audit_and_protect(self, snapshot: MarketSnapshot) -> Dict[str, Any]:
         """
@@ -167,6 +243,8 @@ class RiskGuard:
                         p = tickers_reset.get(f"{coin}/USD", {}).get("LastPrice", 0.0)
                         reset_val += (qty * p)
                 self.portfolio_high_watermark = reset_val
+                if self.state_store:
+                    self.state_store.save_circuit_breaker(self.portfolio_high_watermark, self.circuit_breaker_active, self.circuit_breaker_until)
                 logger.info(f"[CIRCUIT BREAKER EXPIRED] Resuming operations. HWM reset to ${reset_val:,.2f}")
 
         ticker_resp = self.roostoo.get_ticker()
@@ -188,10 +266,35 @@ class RiskGuard:
                 p = (ask_p + bid_p) / 2.0 if (ask_p > 0 and bid_p > 0) else last_p
                 total_val += (qty * p)
 
+        # UNIFIED EQUITY ACCOUNTING: Account for short collateral & unrealized PnL in risk guard total_val
+        try:
+            short_resp = self.roostoo.get_short_positions()
+            active_shorts = short_resp.get("Positions", short_resp.get("Data", []))
+            if isinstance(active_shorts, list):
+                for spos in active_shorts:
+                    spair = spos.get("Pair", spos.get("pair", ""))
+                    scollat = float(spos.get("Collateral", spos.get("collateral", 0.0)))
+                    sentry = float(spos.get("EntryPrice", spos.get("entry_price", spos.get("OpenPrice", 0.0))))
+                    sqty = float(spos.get("Quantity", spos.get("quantity", 0.0)))
+                    scurr_p = tickers.get(spair, {}).get("LastPrice", sentry)
+
+                    if scollat <= 0 and sqty > 0 and sentry > 0:
+                        scollat = sqty * sentry
+
+                    upnl = (sentry - scurr_p) * sqty if (sentry > 0 and sqty > 0) else 0.0
+                    short_equity = max(0.0, scollat + upnl)
+                    total_val += short_equity
+        except Exception as e:
+            logger.debug(f"Note: Error accounting for short equity in risk guard total_val: {e}")
+
         if self.portfolio_high_watermark <= 0.0 and total_val > 0.0:
             self.portfolio_high_watermark = total_val
+            if self.state_store:
+                self.state_store.save_circuit_breaker(self.portfolio_high_watermark, self.circuit_breaker_active, self.circuit_breaker_until)
         elif total_val > self.portfolio_high_watermark:
             self.portfolio_high_watermark = total_val
+            if self.state_store:
+                self.state_store.save_circuit_breaker(self.portfolio_high_watermark, self.circuit_breaker_active, self.circuit_breaker_until)
 
         # Circuit Breaker Check (dynamic calibration for any portfolio size)
         drawdown_pct = ((self.portfolio_high_watermark - total_val) / self.portfolio_high_watermark * 100.0) if self.portfolio_high_watermark > 0.0 else 0.0
@@ -203,10 +306,12 @@ class RiskGuard:
             self._emergency_liquidate_all(tickers, snapshot.exchange_info)
             self.circuit_breaker_active = True
             self.circuit_breaker_until = now + (settings.CIRCUIT_BREAKER_COOLDOWN_HOURS * 3600)
+            if self.state_store:
+                self.state_store.save_circuit_breaker(self.portfolio_high_watermark, self.circuit_breaker_active, self.circuit_breaker_until)
             return {"Status": "CIRCUIT_BREAKER_TRIGGERED", "Drawdown": drawdown_pct}
 
-        # 2. Synchronize position state
-        self.update_positions_from_wallet(tickers, snapshot.exchange_info)
+        # 2. Synchronize position state with adaptive ATR stops
+        self.update_positions_from_wallet(tickers, snapshot.exchange_info, snapshot)
 
         # 3. Audit Individual Open Positions (Long and Short)
         for key, pos in list(self.active_positions.items()):
@@ -236,6 +341,7 @@ class RiskGuard:
                     if new_stop > pos.effective_stop_price:
                         pos.effective_stop_price = new_stop
                         pos.is_ratcheted = True
+                        self._persist_position(pos)
                         logger.info(
                             f"[PROFIT RATCHET LONG] {pos.pair} gained +{gain_pct:.2f}%. "
                             f"Stop ratcheted to Breakeven (+0.4% fees covered): ${new_stop:,.4f}"
@@ -247,6 +353,7 @@ class RiskGuard:
                     trail_stop = pos.peak_price * (1.0 - settings.TRAILING_STOP_OFFSET_PCT / 100.0)
                     if trail_stop > pos.effective_stop_price:
                         pos.effective_stop_price = trail_stop
+                        self._persist_position(pos)
                         logger.info(
                             f"[TRAILING STOP LONG] {pos.pair} peak ${pos.peak_price:,.4f}. "
                             f"Trailing stop ratcheted to ${trail_stop:,.4f}"
@@ -278,14 +385,23 @@ class RiskGuard:
                         self._execute_stop_sell(pos.pair, pos, curr_price, snapshot.exchange_info, reason="Early Momentum Decay Cut")
                         continue
 
-                # Check Stop-Loss Execution
+                # Check Stop-Loss Execution with Single-Tick Defense
                 if curr_price <= pos.effective_stop_price:
-                    loss_or_gain = "Stop-Loss" if curr_price < pos.entry_price else "Trailing Take-Profit"
-                    logger.warning(
-                        f"[{loss_or_gain.upper()} TRIGGERED] {pos.pair} Price: ${curr_price:,.4f} <= Stop: ${pos.effective_stop_price:,.4f}. "
-                        f"Executing immediate market liquidation!"
-                    )
-                    self._execute_stop_sell(pos.pair, pos, curr_price, snapshot.exchange_info, reason=loss_or_gain)
+                    tick_info = tickers.get(pos.pair, {})
+                    bid_p = tick_info.get("BidPrice", curr_price)
+                    # If Bid price is still above stop price, treat as transient single-tick wick anomaly
+                    if bid_p > pos.effective_stop_price and curr_price <= pos.effective_stop_price:
+                        logger.info(
+                            f"[STOP DEFENSE] {pos.pair} last price ${curr_price:,.4f} wicked below stop ${pos.effective_stop_price:,.4f}, "
+                            f"but Bid is ${bid_p:,.4f}. Holding."
+                        )
+                    else:
+                        loss_or_gain = "Stop-Loss" if curr_price < pos.entry_price else "Trailing Take-Profit"
+                        logger.warning(
+                            f"[{loss_or_gain.upper()} TRIGGERED] {pos.pair} Price: ${curr_price:,.4f} <= Stop: ${pos.effective_stop_price:,.4f}. "
+                            f"Executing immediate market liquidation!"
+                        )
+                        self._execute_stop_sell(pos.pair, pos, curr_price, snapshot.exchange_info, reason=loss_or_gain)
 
             # ==========================================
             # AUDIT CASE B: SHORT POSITION
@@ -307,6 +423,7 @@ class RiskGuard:
                     if new_stop < pos.effective_stop_price:
                         pos.effective_stop_price = new_stop
                         pos.is_ratcheted = True
+                        self._persist_position(pos)
                         logger.info(
                             f"[PROFIT RATCHET SHORT] {pos.pair} price dropped {gain_pct:.2f}%. "
                             f"Short stop ratcheted to lock profit (+0.4% fees covered): ${new_stop:,.4f}"
@@ -318,6 +435,7 @@ class RiskGuard:
                     trail_stop = pos.peak_price * (1.0 + settings.TRAILING_STOP_OFFSET_PCT / 100.0)
                     if trail_stop < pos.effective_stop_price:
                         pos.effective_stop_price = trail_stop
+                        self._persist_position(pos)
                         logger.info(
                             f"[TRAILING STOP SHORT] {pos.pair} reached low ${pos.peak_price:,.4f}. "
                             f"Short trailing stop ratcheted to ${trail_stop:,.4f}"
@@ -382,6 +500,10 @@ class RiskGuard:
             )
         if pair in self.active_positions:
             del self.active_positions[pair]
+        if self.state_store:
+            self.state_store.remove_position(pair)
+            if "Stop-Loss" in reason or "Toxicity" in reason or "Decay" in reason:
+                self.state_store.quarantine_asset(pair, duration_hours=settings.QUARANTINE_DURATION_HOURS, reason=reason)
 
     def _execute_short_close(self, pair: str, pos: PositionTracker, price: float, reason: str):
         resp = self.roostoo.short_close(pair=pair, close_pct=100.0)
@@ -400,15 +522,20 @@ class RiskGuard:
         key = f"SHORT_{pair}" if f"SHORT_{pair}" in self.active_positions else pair
         if key in self.active_positions:
             del self.active_positions[key]
+        if self.state_store:
+            self.state_store.remove_position(key)
+            if "Stop-Loss" in reason or "Squeeze" in reason:
+                self.state_store.quarantine_asset(pair, duration_hours=settings.QUARANTINE_DURATION_HOURS, reason=reason)
 
     def _emergency_liquidate_all(self, tickers: Dict[str, Any], exchange_info: Dict[str, Any]):
         """
-        Asynchronously executes full portfolio liquidation across all positions concurrently
-        via ThreadPoolExecutor to minimize latency and slippage during flash crashes.
+        Rate-limited emergency portfolio liquidation across all positions.
+        Uses ThreadPoolExecutor bounded by MAX_CONCURRENT_LIQUIDATION_WORKERS to prevent HTTP 429 bans.
         """
         def _liquidate_item(item):
             key, pos = item
             curr_p = tickers.get(pos.pair, {}).get("LastPrice", pos.entry_price)
+            time.sleep(0.1)  # Stagger requests to prevent 429 rate limit errors
             if pos.side == "SHORT":
                 self._execute_short_close(pos.pair, pos, curr_p, reason="Circuit Breaker Short Liquidation")
             else:
@@ -418,5 +545,6 @@ class RiskGuard:
         if not items:
             return
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(items))) as executor:
+        workers = min(settings.MAX_CONCURRENT_LIQUIDATION_WORKERS, len(items))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
             list(executor.map(_liquidate_item, items))

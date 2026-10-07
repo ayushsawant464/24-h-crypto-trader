@@ -1,4 +1,4 @@
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 from bot.config.settings import settings
 from bot.data.market_feed import MarketSnapshot, AssetMetrics
 from bot.strategy.base import BaseStrategy, StrategyDecision
@@ -9,9 +9,17 @@ class DecisionEngine(BaseStrategy):
     Quantitative Decision Engine implementing the 5 Calculating Gates
     and Positive Expected Value Hurdle from DECISION_CALCULUS.md.
     """
-    def __init__(self):
+    def __init__(self, state_store: Optional[Any] = None):
         self.min_expected_return = settings.MIN_EXPECTED_NET_RETURN_PCT
         self.friction_pct = 0.22  # 2 * 0.1% fee + 0.02% typical spread
+        if state_store is None:
+            try:
+                from bot.data.state_store import StateStore
+                self.state_store = StateStore()
+            except Exception:
+                self.state_store = None
+        else:
+            self.state_store = state_store
 
     def calculate_expected_value(self, metric: AssetMetrics) -> float:
         """
@@ -19,7 +27,7 @@ class DecisionEngine(BaseStrategy):
         E[R_net] = P(Win) * E[R_win] - P(Loss) * E[R_loss] - Friction
         
         Calibrated to the bot's dynamic lifecycle:
-        - Big Runner (Trailing Stop): E[R] ~ +5.2%
+        - Big Runner (Trailing Stop): E[R] ~ (Trigger - Offset) * vol_scale (+2.8% to +3.5%)
         - Profit Ratchet (Breakeven): E[R] ~ +0.40%
         - Cycle Rotation / Drift: E[R] ~ +1.0%
         - Controlled Stop / Decay: E[R] ~ -1.6%
@@ -35,16 +43,17 @@ class DecisionEngine(BaseStrategy):
 
         vol_scale = max(1.0, metric.atr_15m_pct / 0.8) if metric.atr_15m_pct > 0 else 1.0
 
-        # Weighted expectation of winning trades:
-        # 45% runners, 35% ratchets, 20% rebalance drift
-        r_runner = (settings.TRAILING_STOP_TRIGGER_PCT + settings.TRAILING_STOP_OFFSET_PCT) * vol_scale  # ~5.2%
+        # Trailing stop base floor = Trigger (4.0%) - Offset (1.2%) = 2.8%
+        # Empirical runner extension driven by alpha and cross-crypto lag catchup
+        alpha_extension = max(0.0, metric.residual_alpha_pct, getattr(metric, 'lag_spread_4h_pct', 0.0))
+        r_runner = (settings.TRAILING_STOP_TRIGGER_PCT - settings.TRAILING_STOP_OFFSET_PCT + alpha_extension) * 1.25 * vol_scale
         r_ratchet = settings.PROFIT_RATCHET_LOCK_PCT                                                    # +0.40%
         r_drift = 1.0 * vol_scale                                                                       # +1.0%
         expected_win_payoff = (0.45 * r_runner) + (0.35 * r_ratchet) + (0.20 * r_drift)
 
         # Expected loss of losing trades:
-        # Exited early via momentum decay cut (-1.2%) or hard stop (-2.5%)
-        expected_loss_payoff = 1.60 * vol_scale
+        # Exited early via momentum decay cut (-1.2%) or hard stop
+        expected_loss_payoff = 1.30 * vol_scale
 
         ev_net = (p_win * expected_win_payoff) - (p_loss * expected_loss_payoff) - self.friction_pct
         return round(ev_net, 3)
@@ -146,11 +155,11 @@ class DecisionEngine(BaseStrategy):
             }
         else: # SIDEWAYS_STABILITY
             anchor_budget = settings.SIDEWAYS_ANCHOR_WEIGHT      # 60% Core
-            satellite_budget = settings.SIDEWAYS_SMART_CONTRACTS_WEIGHT + settings.SIDEWAYS_INFRASTRUCTURE_WEIGHT + settings.SIDEWAYS_SPECULATIVE_WEIGHT # 20%
+            satellite_budget = settings.SIDEWAYS_SATELLITE_WEIGHT # 20%
             tier_budgets = {
-                "TIER_SMART_CONTRACTS": 0.20,
-                "TIER_INFRASTRUCTURE": 0.10,
-                "TIER_SPECULATIVE": 0.05
+                "TIER_SMART_CONTRACTS": settings.SIDEWAYS_SMART_CONTRACTS_WEIGHT,  # 12%
+                "TIER_INFRASTRUCTURE": settings.SIDEWAYS_INFRASTRUCTURE_WEIGHT,    # 5%
+                "TIER_SPECULATIVE": settings.SIDEWAYS_SPECULATIVE_WEIGHT           # 3%
             }
 
         # --- 1. Tier 1: Anchor Allocation (Mega-Cap Stability: BTC or ETH) ---
@@ -167,12 +176,12 @@ class DecisionEngine(BaseStrategy):
 
         # --- 2. Screen & Rank Candidates Across Satellite Tiers ---
         # Helper to score candidates combining Lag Spread (catch-up bonus), Alpha, and Taker Flow
+        # Free from nominal unit-price bias: Evaluates purely on momentum, orderflow, and statistical edge
         def score_candidate(m: AssetMetrics) -> float:
             lag_bonus = max(0.0, m.lag_spread_4h_pct) * 1.5
             alpha = m.residual_alpha_pct
             orderflow = (m.taker_buy_4h_pct - 50.0) * 0.5
-            price_pref = 1.0 / max(m.last_price ** 0.1, 1.0)
-            return (lag_bonus + alpha + orderflow) * price_pref
+            return lag_bonus + alpha + orderflow
 
         def get_tier_name(sym: str) -> str:
             # Robust normalization: handles SOL/USD, SOLUSDT, and raw SOL
@@ -198,6 +207,11 @@ class DecisionEngine(BaseStrategy):
         for sym, m in snapshot.assets.items():
             if sym in ("BTCUSDT", "PAXGUSDT"):
                 continue  # Benchmark and Gold handled separately
+
+            # Asset Quarantine Filter: do not repurchase stopped-out assets during cooloff
+            if self.state_store and self.state_store.is_quarantined(m.roostoo_pair):
+                logger.info(f"[DECISION ENGINE] Skipping {m.roostoo_pair} - under 12h stop-loss quarantine.")
+                continue
 
             # Gate 2: Liquidity & Spread
             if not m.is_liquid:
@@ -263,9 +277,19 @@ class DecisionEngine(BaseStrategy):
                     )
                     expected_returns[m.roostoo_pair] = ev
 
-        # --- 3. Cash Buffer Allocation ---
+        # --- 3. Target Weight Normalization & Cash Buffer Allocation ---
         # Encumbered capital (spot longs + short collateral) must be summed by absolute value
         allocated_so_far = sum(abs(w) for k, w in target_weights.items() if k != "USD")
+        max_non_cash = round(1.0 - settings.MIN_CASH_BUFFER, 4)
+        
+        # Guard against portfolio budget overrun (> 80% non-cash):
+        if allocated_so_far > max_non_cash and allocated_so_far > 0:
+            scale = max_non_cash / allocated_so_far
+            for k in list(target_weights.keys()):
+                if k != "USD":
+                    target_weights[k] = round(target_weights[k] * scale, 3)
+            allocated_so_far = sum(abs(w) for k, w in target_weights.items() if k != "USD")
+
         cash_weight = max(settings.MIN_CASH_BUFFER, round(1.0 - allocated_so_far, 3))
         target_weights["USD"] = cash_weight
         rationales["USD"] = f"Liquid Cash Buffer ({cash_weight*100:.1f}%) preserving capital and absorbing trading fees."
