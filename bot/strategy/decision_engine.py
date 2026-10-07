@@ -97,8 +97,61 @@ class DecisionEngine(BaseStrategy):
         # =========================================================================
         # REGIME B & C: BULL EXPANSION & SIDEWAYS STABILITY (Core-Satellite Engine)
         # =========================================================================
-        # Screen candidates for satellite basket through Gates 2, 3, and 4
-        candidates: List[AssetMetrics] = []
+        # =========================================================================
+        # REGIME B & C: BULL EXPANSION & SIDEWAYS STABILITY (4-Tier Engine)
+        # =========================================================================
+        if regime == "BULL_EXPANSION":
+            anchor_budget = settings.BULL_ANCHOR_WEIGHT          # 20% Core
+            satellite_budget = settings.BULL_SATELLITE_WEIGHT    # 60% Satellites
+            tier_budgets = {
+                "TIER_SMART_CONTRACTS": settings.BULL_SMART_CONTRACTS_WEIGHT,  # 35%
+                "TIER_INFRASTRUCTURE": settings.BULL_INFRASTRUCTURE_WEIGHT,    # 15%
+                "TIER_SPECULATIVE": settings.BULL_SPECULATIVE_WEIGHT           # 10%
+            }
+        else: # SIDEWAYS_STABILITY
+            anchor_budget = settings.SIDEWAYS_ANCHOR_WEIGHT      # 60% Core
+            satellite_budget = settings.SIDEWAYS_SMART_CONTRACTS_WEIGHT + settings.SIDEWAYS_INFRASTRUCTURE_WEIGHT + settings.SIDEWAYS_SPECULATIVE_WEIGHT # 20%
+            tier_budgets = {
+                "TIER_SMART_CONTRACTS": 0.20,
+                "TIER_INFRASTRUCTURE": 0.10,
+                "TIER_SPECULATIVE": 0.05
+            }
+
+        # --- 1. Tier 1: Anchor Allocation (Mega-Cap Stability: BTC or ETH) ---
+        eth_metric = snapshot.assets.get("ETHUSDT")
+        anchor_pair = "BTC/USD"
+        if eth_metric and btc_metric and eth_metric.return_12h_pct > btc_metric.return_12h_pct and eth_metric.taker_buy_4h_pct > 50.0:
+            anchor_pair = "ETH/USD"
+
+        target_weights[anchor_pair] = round(anchor_budget, 3)
+        rationales[anchor_pair] = f"Tier 1: Core Anchor ({anchor_budget*100:.0f}%) | Regime: {regime} | Mega-cap market presence."
+        expected_returns[anchor_pair] = 0.50
+
+        # --- 2. Screen & Rank Candidates Across Satellite Tiers ---
+        # Helper to score candidates combining Lag Spread (catch-up bonus), Alpha, and Taker Flow
+        def score_candidate(m: AssetMetrics) -> float:
+            lag_bonus = max(0.0, m.lag_spread_4h_pct) * 1.5
+            alpha = m.residual_alpha_pct
+            orderflow = (m.taker_buy_4h_pct - 50.0) * 0.5
+            price_pref = 1.0 / max(m.last_price ** 0.1, 1.0)
+            return (lag_bonus + alpha + orderflow) * price_pref
+
+        def get_tier_name(sym: str) -> str:
+            if sym in settings.TIER_SMART_CONTRACTS:
+                return "TIER_SMART_CONTRACTS"
+            if sym in settings.TIER_INFRASTRUCTURE:
+                return "TIER_INFRASTRUCTURE"
+            if sym in settings.TIER_SPECULATIVE:
+                return "TIER_SPECULATIVE"
+            return "TIER_SPECULATIVE"
+
+        # Screen through Gates 2, 3, 4 and Net EV hurdle
+        candidates_by_tier: Dict[str, List[AssetMetrics]] = {
+            "TIER_SMART_CONTRACTS": [],
+            "TIER_INFRASTRUCTURE": [],
+            "TIER_SPECULATIVE": []
+        }
+
         for sym, m in snapshot.assets.items():
             if sym in ("BTCUSDT", "PAXGUSDT"):
                 continue  # Benchmark and Gold handled separately
@@ -115,63 +168,57 @@ class DecisionEngine(BaseStrategy):
             if m.vol_zscore_15m > 2.5 and m.return_15m_pct < 0.0:
                 continue
 
-            # Gate 4: Alpha Identification (Momentum & Residual Alpha)
-            if m.return_12h_pct < 1.0:
+            # Gate 4: Alpha Identification (Momentum or Lag Catch-up)
+            if m.return_12h_pct < 1.0 and m.lag_spread_4h_pct < 0.8:
                 continue
-            if m.residual_alpha_pct <= 0.0:
+            if m.residual_alpha_pct <= 0.0 and m.lag_spread_4h_pct < 0.8:
                 continue
 
-            # Positive Expected Value Hurdle
+            # Positive Net EV Hurdle
             ev = self.calculate_expected_value(m)
             if ev < self.min_expected_return:
                 continue
 
-            candidates.append(m)
+            tier_key = get_tier_name(sym)
+            candidates_by_tier[tier_key].append(m)
 
-        if regime == "BULL_EXPANSION":
-            anchor_budget = settings.BULL_ANCHOR_WEIGHT        # 20% Core
-            satellite_budget = settings.BULL_SATELLITE_WEIGHT  # 60% Small-Cap Basket
-        else: # SIDEWAYS_STABILITY
-            anchor_budget = settings.SIDEWAYS_ANCHOR_WEIGHT    # 60% Core
-            satellite_budget = settings.SIDEWAYS_SATELLITE_WEIGHT  # 20% Small-Cap Basket
+        # Select top asset in each tier sorted by composite lag+alpha score
+        selected_tier_assets: Dict[str, AssetMetrics] = {}
+        for t_key, c_list in candidates_by_tier.items():
+            if c_list:
+                c_list.sort(key=score_candidate, reverse=True)
+                selected_tier_assets[t_key] = c_list[0]
 
-        # --- 1. Anchor Allocation (Mega-Cap Stability: BTC or ETH) ---
-        eth_metric = snapshot.assets.get("ETHUSDT")
-        anchor_pair = "BTC/USD"
-        # If ETH has superior risk-adjusted momentum and taker buy, use ETH as anchor
-        if eth_metric and btc_metric and eth_metric.return_12h_pct > btc_metric.return_12h_pct and eth_metric.taker_buy_4h_pct > 50.0:
-            anchor_pair = "ETH/USD"
+        all_selected = list(selected_tier_assets.values())
 
-        target_weights[anchor_pair] = round(anchor_budget, 3)
-        rationales[anchor_pair] = f"Anchor Core ({anchor_budget*100:.0f}%) | Regime: {regime} | Mega-cap stability & market presence."
-        expected_returns[anchor_pair] = 0.50
+        if len(all_selected) == 1:
+            # Concentrated single runner: allocate up to max single-asset allocation
+            single_m = all_selected[0]
+            ev = self.calculate_expected_value(single_m)
+            single_weight = 0.20 if regime == "SIDEWAYS_STABILITY" else min(0.35, satellite_budget)
+            target_weights[single_m.roostoo_pair] = single_weight
+            rationales[single_m.roostoo_pair] = (
+                f"{get_tier_name(single_m.symbol).replace('_', ' ').title()} ({single_weight*100:.1f}%) | "
+                f"LagSpread: {single_m.lag_spread_4h_pct:+.2f}% | Alpha: {single_m.residual_alpha_pct:+.2f}% | "
+                f"TakerBuy: {single_m.taker_buy_4h_pct:.1f}%"
+            )
+            expected_returns[single_m.roostoo_pair] = ev
 
-        # --- 2. Satellite Allocation (Diversified Lower-Price / High-Beta Assets) ---
-        # Sort candidates: preference to lower price / high beta with strong order flow
-        candidates.sort(
-            key=lambda x: (x.residual_alpha_pct + (x.taker_buy_4h_pct - 50.0) * 0.5) / max(x.last_price ** 0.1, 1.0),
-            reverse=True
-        )
-
-        selected_satellites = candidates[:3]
-        if selected_satellites:
-            # Weighted diversification across satellite basket
-            total_inv_vol = sum(1.0 / max(m.atr_15m_pct, 0.4) for m in selected_satellites)
-            for m in selected_satellites:
+        elif len(all_selected) > 1:
+            # Multi-tier diversified basket: allocate based on tier weights
+            total_budget_needed = sum(tier_budgets[t_key] for t_key in selected_tier_assets.keys())
+            scale = min(1.0, satellite_budget / max(total_budget_needed, 1e-6))
+            for t_key, m in selected_tier_assets.items():
                 ev = self.calculate_expected_value(m)
-                weight_fraction = (1.0 / max(m.atr_15m_pct, 0.4)) / max(total_inv_vol, 1e-6)
-                sat_weight = min(0.30, round(satellite_budget * weight_fraction, 3))
-                
-                if sat_weight >= 0.05:
-                    target_weights[m.roostoo_pair] = sat_weight
+                w = round(tier_budgets[t_key] * scale, 3)
+                if w >= 0.05:
+                    target_weights[m.roostoo_pair] = w
                     rationales[m.roostoo_pair] = (
-                        f"Satellite Basket ({sat_weight*100:.1f}%) | LastPrice: ${m.last_price:.4f} | "
-                        f"12h Ret: {m.return_12h_pct:+.2f}% | Alpha: {m.residual_alpha_pct:+.2f}% | TakerBuy: {m.taker_buy_4h_pct:.1f}%"
+                        f"{t_key.replace('_', ' ').title()} ({w*100:.1f}%) | "
+                        f"LagSpread: {m.lag_spread_4h_pct:+.2f}% | Alpha: {m.residual_alpha_pct:+.2f}% | "
+                        f"TakerBuy: {m.taker_buy_4h_pct:.1f}%"
                     )
                     expected_returns[m.roostoo_pair] = ev
-        else:
-            # If no satellite passed, shift satellite budget into Anchor / Cash
-            target_weights[anchor_pair] = min(0.70, round(target_weights[anchor_pair] + (satellite_budget * 0.5), 3))
 
         # --- 3. Cash Buffer Allocation ---
         allocated_so_far = sum(w for k, w in target_weights.items() if k != "USD")

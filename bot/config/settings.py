@@ -54,19 +54,33 @@ class Settings:
     MIN_TAKER_BUY_PCT: float = 51.0             # Gate 3: Minimum informed taker buy %
     MIN_EXPECTED_NET_RETURN_PCT: float = 0.80   # Core Hurdle: Positive Net Expectancy
     
-    # Portfolio Allocation Rules (Core-Satellite Architecture)
-    MAX_ALLOCATION_PER_ASSET: float = 0.40      # Max 40% for anchor / 30% for satellite
+    # Portfolio Allocation Constraints
+    MAX_ALLOCATION_PER_ASSET: float = 0.40      # Max 40% for any single asset
     MAX_TOTAL_INVESTED: float = 0.80            # Max 80% total exposure
-    MIN_CASH_BUFFER: float = 0.20               # Keep 20% in USD Cash
+    MIN_CASH_BUFFER: float = 0.20               # Keep 20% in USD Cash Buffer
     
-    # Regime Weights: Anchor (BTC/ETH) : Satellite (Small-Caps) : Cash
-    BASELINE_ANCHOR_WEIGHT: float = 0.40        # 40% Core
-    BASELINE_SATELLITE_WEIGHT: float = 0.40     # 40% Small-Cap Basket
-    BULL_ANCHOR_WEIGHT: float = 0.20            # 20% Core in Bull
-    BULL_SATELLITE_WEIGHT: float = 0.60         # 60% Small-Cap Basket in Bull
-    SIDEWAYS_ANCHOR_WEIGHT: float = 0.60        # 60% Core in Sideways
-    SIDEWAYS_SATELLITE_WEIGHT: float = 0.20     # 20% Small-Cap Basket in Sideways
-    
+    # 4-Tier Categorical Portfolio Structure
+    TIER_ANCHOR = ["BTCUSDT", "ETHUSDT"]
+    TIER_SMART_CONTRACTS = ["ETHUSDT", "SOLUSDT", "SUIUSDT"]
+    TIER_INFRASTRUCTURE = ["LINKUSDT", "TAOUSDT", "NEARUSDT"]
+    TIER_SPECULATIVE = ["DOGEUSDT", "AVAXUSDT", "BNBUSDT", "XRPUSDT", "ADAUSDT"]
+
+    # Baseline / Sideways Regime Weights (Anchor 60% : Satellite 20% : Cash 20%)
+    SIDEWAYS_ANCHOR_WEIGHT: float = 0.60        # 60% Anchor Core (BTC)
+    SIDEWAYS_SATELLITE_WEIGHT: float = 0.20     # 20% Total Satellite Budget
+    SIDEWAYS_SMART_CONTRACTS_WEIGHT: float = 0.15 # Tier 2: Smart Contract Platforms
+    SIDEWAYS_INFRASTRUCTURE_WEIGHT: float = 0.05  # Tier 3: Infrastructure & AI
+    SIDEWAYS_SPECULATIVE_WEIGHT: float = 0.00    # Tier 4: Speculative minimized in sideways
+    SIDEWAYS_CASH_WEIGHT: float = 0.20          # 20% Free USD Cash Buffer
+
+    # Bull Expansion Regime Weights (Anchor 20% : Satellites 60% : Cash 20%)
+    BULL_ANCHOR_WEIGHT: float = 0.20            # 20% Anchor Core (BTC)
+    BULL_SATELLITE_WEIGHT: float = 0.60         # 60% Total Satellite Budget
+    BULL_SMART_CONTRACTS_WEIGHT: float = 0.35   # Tier 2: Smart Contract Platforms
+    BULL_INFRASTRUCTURE_WEIGHT: float = 0.15    # Tier 3: Infrastructure & AI
+    BULL_SPECULATIVE_WEIGHT: float = 0.10       # Tier 4: High-Beta Retail Plays
+    BULL_CASH_WEIGHT: float = 0.20              # 20% Free USD Cash Buffer
+
     # Bear Market Regime Weights (Defense & Capital Preservation)
     BEAR_CASH_WEIGHT: float = 0.70              # 70% Free USD Cash Bunker
     BEAR_GOLD_WEIGHT: float = 0.20              # 20% PAXG/USD (Safe-Haven Gold)

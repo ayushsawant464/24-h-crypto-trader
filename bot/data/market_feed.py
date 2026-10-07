@@ -25,6 +25,7 @@ class AssetMetrics:
     beta_to_btc: float
     residual_alpha_pct: float
     is_liquid: bool
+    lag_spread_4h_pct: float = 0.0
 
 @dataclass
 class MarketSnapshot:
@@ -88,6 +89,7 @@ class MarketFeed:
         btc_tb_pct = 50.0
         btc_atr_normal = True
         btc_ret_12h = 0.0
+        btc_ret_4h = 0.0
 
         if not btc_1h.empty:
             ema20 = btc_1h['close'].ewm(span=20).mean().iloc[-1]
@@ -95,6 +97,8 @@ class MarketFeed:
             btc_above_ema20 = bool(last_btc >= ema20)
             btc_tb_pct = (btc_1h['tb_quote'].iloc[-4:].sum() / max(btc_1h['quote_volume'].iloc[-4:].sum(), 1e-9)) * 100
             btc_ret_12h = (btc_1h['close'].iloc[-1] - btc_1h['close'].iloc[-12]) / btc_1h['close'].iloc[-12] * 100
+            if len(btc_1h) >= 5:
+                btc_ret_4h = (btc_1h['close'].iloc[-1] - btc_1h['close'].iloc[-5]) / btc_1h['close'].iloc[-5] * 100
 
         if not btc_15m.empty:
             tr = np.maximum(
@@ -165,6 +169,10 @@ class MarketFeed:
             # Residual Alpha: Alt Return - Beta * BTC Return
             residual_alpha = ret_12h - (beta * btc_ret_12h)
 
+            # Cross-Crypto Lag Spread: Expected Beta Move - Actual Alt Move (4h horizon)
+            # Positive value indicates altcoin is lagging BTC breakout and due for catch-up drift
+            lag_spread_4h = (beta * btc_ret_4h) - ret_4h
+
             is_liquid = bool(vol_24h >= settings.MIN_24H_VOL_USD and spread_pct <= settings.MAX_SPREAD_PCT)
 
             asset_metrics[sym] = AssetMetrics(
@@ -182,7 +190,8 @@ class MarketFeed:
                 atr_15m_pct=atr_15m_pct,
                 beta_to_btc=beta,
                 residual_alpha_pct=residual_alpha,
-                is_liquid=is_liquid
+                is_liquid=is_liquid,
+                lag_spread_4h_pct=lag_spread_4h
             )
 
         return MarketSnapshot(
