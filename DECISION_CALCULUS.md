@@ -63,22 +63,31 @@ Where:
 * **Condition 3C (No Toxic Dumps)**: Zero 15-minute candles in the past 2 hours with Volume $> 2.5\sigma$ and negative close.
 * *Rationale*: Ensures we are entering alongside informed institutional buyers and never buying into a whale offloading inventory.
 
-### Gate 4: Alpha Thesis Identification
-The bot must classify the exact alpha source:
-* **Alpha Type A (Cross-Sectional Momentum)**: 
-  * 12-Hour Return $\ge +2.0\%$ AND Return ranked in Top 3 of the universe.
-  * Risk-Adjusted Momentum Score: $\frac{R_{12\text{h}}}{\text{ATR}_{12\text{h}}} \ge 1.5$.
-* **Alpha Type B (Mean-Reverting Relative-Value Pair)**:
-  * Spread Z-score against BTC: $Z_{\text{spread}} < -2.0\sigma$.
-  * Cointegration ADF p-value $< 0.05$.
+### Gate 4: Alpha Thesis Identification & Cross-Crypto Lag Signal
+The bot must classify the exact statistical alpha source:
+* **Alpha Type A (Beta-Disparity Cross-Crypto Lag Signal)**:
+  Altcoins lag Bitcoin expansions by 2 to 4 hours due to information diffusion delays. The expected catch-up move is governed by:
+  $$\text{LagSpread}_i(t) = \beta_i \cdot R_{\text{BTC}, 4\text{h}}(t) - R_{i, 4\text{h}}(t)$$
+  Where $\beta_i = \frac{\text{Cov}(R_i, R_{\text{BTC}})}{\text{Var}(R_{\text{BTC}})}$ is the rolling 24-hour empirical beta.
+  * *Condition*: $\text{LagSpread}_i \ge +1.0\%$ AND 4-Hour Taker Buy $\ge 51.0\%$.
+  * *Calculus*: Altcoin $i$ has lagged BTC's upward breakout relative to its expected sensitivity; institutional taker buying indicates an imminent catch-up drift (+0.64% to +1.43% forward edge).
+* **Alpha Type B (Cross-Sectional Momentum & Residual Alpha)**: 
+  * 12-Hour Return $\ge +1.0\%$ AND Residual Alpha $\alpha_i = R_{i, 12\text{h}} - \beta_i R_{\text{BTC}, 12\text{h}} > 0$.
+  * Taker Imbalance $\ge 0.0$.
 
-### Gate 5: Position Sizing & Allocation Calculus
-* **Volatility Parity Allocation**:
-  $$W_i = \min\left(0.30, \frac{\text{Target Risk (1.0\%)}}{\text{ATR}_{i,\%}}\right)$$
-* **Constraints**:
-  * Max Single-Asset Allocation: **$30\%$** ($30,000 USD).
-  * Max Total Invested Exposure: **$80\%$** ($80,000 USD).
-  * Minimum Cash Reserve: **$20\%$** ($20,000 USD) held in free USD balance at all times.
+### Gate 5: 4-Tier Categorical Portfolio Sizing Matrix
+Portfolio capital is allocated according to institutional risk budgeting across 4 categorical tiers:
+
+| Tier | Categorical Basket | Baseline / Sideways | Bull Expansion | Bear Contraction |
+| :--- | :--- | :---: | :---: | :---: |
+| **Tier 1: Core Anchor** | BTC (fallback ETH) | **60%** | **20%** | **0%** |
+| **Tier 2: Smart Contracts** | ETH, SOL, SUI | **15% - 20%** | **35%** | **0%** |
+| **Tier 3: Infrastructure & AI** | LINK, TAO, NEAR | **5% - 10%** | **15%** | **0%** |
+| **Tier 4: Speculative Beta** | DOGE, AVAX, BNB, XRP, ADA | **0% - 5%** | **10%** | **0%** |
+| **Defense / Safe Haven** | USD Cash + PAXG Gold + Short BTC | **20% Cash** | **20% Cash** | **70% Cash + 20% PAXG + 10% Short** |
+
+* **Single-Asset Cap**: Max **40%** ($40,000 USD).
+* **Minimum Cash Buffer**: Kept at $\ge 15\% - 20\%$ to absorb exchange taker fees (0.10%) and ensure zero liquidation risk.
 
 ---
 
