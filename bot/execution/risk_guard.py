@@ -108,7 +108,7 @@ class RiskGuard:
         Uses adaptive ATR stops and preserves historical entry prices across restarts.
         """
         balance_resp = self.roostoo.get_balance()
-        wallet = balance_resp.get("Wallet", {})
+        wallet = balance_resp.get("SpotWallet") or balance_resp.get("Wallet") or {}
 
         current_pairs = set()
         for coin, val in wallet.items():
@@ -235,7 +235,7 @@ class RiskGuard:
                 ticker_resp_reset = self.roostoo.get_ticker()
                 tickers_reset = ticker_resp_reset.get("Data", {})
                 bal_reset = self.roostoo.get_balance()
-                wallet_reset = bal_reset.get("Wallet", {})
+                wallet_reset = bal_reset.get("SpotWallet") or bal_reset.get("Wallet") or {}
                 reset_val = float(wallet_reset.get("USD", {}).get("Free", 0.0)) + float(wallet_reset.get("USD", {}).get("Lock", 0.0))
                 for coin, val in wallet_reset.items():
                     if coin != "USD":
@@ -252,7 +252,7 @@ class RiskGuard:
 
         # 1. Update High Watermark & Check Portfolio Circuit Breaker
         balance_resp = self.roostoo.get_balance()
-        wallet = balance_resp.get("Wallet", {})
+        wallet = balance_resp.get("SpotWallet") or balance_resp.get("Wallet") or {}
         total_val = float(wallet.get("USD", {}).get("Free", 0.0)) + float(wallet.get("USD", {}).get("Lock", 0.0))
 
         for coin, val in wallet.items():
@@ -474,12 +474,14 @@ class RiskGuard:
         try:
             b_resp = self.roostoo.get_balance()
             c_coin = pair.split("/")[0]
-            curr_free = float(b_resp.get("Wallet", {}).get(c_coin, {}).get("Free", pos.quantity))
+            b_wallet = b_resp.get("SpotWallet") or b_resp.get("Wallet") or {}
+            curr_free = float(b_wallet.get(c_coin, {}).get("Free", pos.quantity))
             if curr_free < pos.quantity * 0.95:  # Balance locked by pending order
                 self.roostoo.cancel_order(pair=pair)
                 time.sleep(0.2)
                 b_resp = self.roostoo.get_balance()
-                curr_free = float(b_resp.get("Wallet", {}).get(c_coin, {}).get("Free", curr_free))
+                b_wallet = b_resp.get("SpotWallet") or b_resp.get("Wallet") or {}
+                curr_free = float(b_wallet.get(c_coin, {}).get("Free", curr_free))
         except Exception as e:
             logger.debug(f"Note: Error checking free balance for stop sell on {pair}: {e}")
 

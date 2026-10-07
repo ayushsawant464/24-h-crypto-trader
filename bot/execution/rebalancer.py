@@ -31,7 +31,7 @@ class PortfolioRebalancer:
         Also includes active short positions and unrealized PnL to prevent portfolio value distortion.
         """
         balance_resp = self.roostoo.get_balance()
-        wallet = balance_resp.get("Wallet", {})
+        wallet = balance_resp.get("SpotWallet") or balance_resp.get("Wallet") or {}
         
         holdings = {}
         free_holdings = {}
@@ -126,7 +126,8 @@ class PortfolioRebalancer:
                         time.sleep(0.2)
                         b_resp = self.roostoo.get_balance()
                         c_coin = pair.split("/")[0]
-                        curr_free = float(b_resp.get("Wallet", {}).get(c_coin, {}).get("Free", curr_free))
+                        b_wallet = b_resp.get("SpotWallet") or b_resp.get("Wallet") or {}
+                        curr_free = float(b_wallet.get(c_coin, {}).get("Free", curr_free))
                     except Exception as e:
                         logger.debug(f"Note: Error cancelling pending order for {pair}: {e}")
 
@@ -262,7 +263,8 @@ class PortfolioRebalancer:
                 continue
 
             fresh_bal = self.roostoo.get_balance()
-            avail_free_usd = float(fresh_bal.get("Wallet", {}).get("USD", {}).get("Free", 0.0))
+            fresh_wallet = fresh_bal.get("SpotWallet") or fresh_bal.get("Wallet") or {}
+            avail_free_usd = float(fresh_wallet.get("USD", {}).get("Free", 0.0))
 
             curr_qty = current_holdings.get(pair, 0.0)
             curr_usd = curr_qty * curr_price

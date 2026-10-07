@@ -75,7 +75,7 @@ def run_preflight(mode: str, test_order: bool = False):
         print("Please verify that your API_KEY and SECRET_KEY are correct.")
         sys.exit(1)
 
-    wallet = bal_resp.get("Wallet", {})
+    wallet = bal_resp.get("SpotWallet") or bal_resp.get("Wallet") or {}
     usd_free = float(wallet.get("USD", {}).get("Free", 0.0))
     usd_lock = float(wallet.get("USD", {}).get("Lock", 0.0))
     print(f"{GREEN}[PASS]{RESET} Authentication & HMAC Signature: VALID")

@@ -114,7 +114,13 @@ class RoostooClient:
 
     def get_balance(self) -> Dict[str, Any]:
         """GET /v3/balance"""
-        return self._request("GET", "/v3/balance", signed=True)
+        resp = self._request("GET", "/v3/balance", signed=True)
+        if isinstance(resp, dict):
+            # Normalize Roostoo API response: supports both "SpotWallet" (live API) and "Wallet" (legacy/mock)
+            wallet = resp.get("SpotWallet") or resp.get("Wallet") or {}
+            resp["Wallet"] = wallet
+            resp["SpotWallet"] = wallet
+        return resp
 
     def get_pending_count(self) -> Dict[str, Any]:
         """GET /v3/pending_count"""

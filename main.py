@@ -66,7 +66,7 @@ def run_bot(mode: str = None):
 
     # 3. Initial Balance Check
     balance_resp = client.get_balance()
-    wallet = balance_resp.get("Wallet", {})
+    wallet = balance_resp.get("SpotWallet") or balance_resp.get("Wallet") or {}
     usd_val = float(wallet.get("USD", {}).get("Free", 0.0))
     logger.info(f"Initial Account Balance: Free USD = ${usd_val:,.2f}")
 
