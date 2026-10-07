@@ -45,14 +45,22 @@ class Settings:
     BINANCE_BASE_URL: str = "https://api.binance.com"
 
     # Execution Timing
-    REBALANCE_INTERVAL_HOURS: int = int(os.getenv("REBALANCE_INTERVAL_HOURS", "8"))
+    REBALANCE_INTERVAL_HOURS: int = int(os.getenv("REBALANCE_INTERVAL_HOURS", "4"))
     RISK_CHECK_INTERVAL_SECONDS: int = int(os.getenv("RISK_CHECK_INTERVAL_SECONDS", "60"))
+    
+    # Continuous Regime Classifier Thresholds (Market Health Score 0 to 100)
+    REGIME_BULL_SCORE_THRESHOLD: float = 65.0   # Score > 65: Bull Expansion
+    REGIME_BEAR_SCORE_THRESHOLD: float = 38.0   # Score < 38: Bear Contraction
     
     # Decision Gates Thresholds
     MIN_24H_VOL_USD: float = 5_000_000.0        # Gate 2: Liquidity filter
     MAX_SPREAD_PCT: float = 0.035               # Gate 2: Max 0.035% bid-ask spread
     MIN_TAKER_BUY_PCT: float = 51.0             # Gate 3: Minimum informed taker buy %
-    MIN_EXPECTED_NET_RETURN_PCT: float = 0.80   # Core Hurdle: Positive Net Expectancy
+    MIN_EXPECTED_NET_RETURN_PCT: float = 0.35   # Core Hurdle: Realistic Multi-Outcome Net Expectancy (35 bps)
+    
+    # Toxicity Confirmation & Early Momentum Decay Thresholds
+    TOXICITY_PRICE_DROP_CONFIRMATION_PCT: float = 0.50  # Must see active price drop to confirm dump
+    EARLY_MOMENTUM_DECAY_PCT: float = 1.20              # Cut deteriorating positions before full 3.5% stop
     
     # Portfolio Allocation Constraints
     MAX_ALLOCATION_PER_ASSET: float = 0.40      # Max 40% for any single asset

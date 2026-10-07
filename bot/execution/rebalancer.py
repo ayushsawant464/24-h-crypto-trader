@@ -21,14 +21,15 @@ class PortfolioRebalancer:
     def __init__(self, roostoo_client: RoostooClient):
         self.roostoo = roostoo_client
 
-    def _get_portfolio_value_and_holdings(self, exchange_info: Dict[str, Any], tickers: Dict[str, Any]) -> Tuple[float, Dict[str, float]]:
+    def _get_portfolio_value_and_holdings(self, exchange_info: Dict[str, Any], tickers: Dict[str, Any]) -> Tuple[float, Dict[str, float], Dict[str, float]]:
         """
-        Calculates total portfolio USD value and current asset quantities from /v3/balance.
+        Calculates total portfolio USD value, total asset quantities, and strictly free asset quantities from /v3/balance.
         """
         balance_resp = self.roostoo.get_balance()
         wallet = balance_resp.get("Wallet", {})
         
         holdings = {}
+        free_holdings = {}
         total_usd_value = 0.0
 
         # USD Cash
@@ -50,9 +51,10 @@ class PortfolioRebalancer:
             
             if tot_qty > 0 and price > 0:
                 holdings[pair] = tot_qty
+                free_holdings[pair] = free_qty
                 total_usd_value += (tot_qty * price)
 
-        return total_usd_value, holdings
+        return total_usd_value, holdings, free_holdings
 
     def execute_rebalance(self, decision: StrategyDecision, exchange_info: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -61,7 +63,7 @@ class PortfolioRebalancer:
         ticker_resp = self.roostoo.get_ticker()
         tickers = ticker_resp.get("Data", {})
         
-        total_val, current_holdings = self._get_portfolio_value_and_holdings(exchange_info, tickers)
+        total_val, current_holdings, free_holdings = self._get_portfolio_value_and_holdings(exchange_info, tickers)
         logger.info(f"[REBALANCE CYCLE] Total Portfolio Value: ${total_val:,.2f} | Regime: {decision.regime}")
 
         if total_val <= 0:
@@ -81,17 +83,29 @@ class PortfolioRebalancer:
 
             # If we need to sell (delta_usd < 0)
             if delta_usd < -25.0:  # Avoid micro dust trades < $25
+                curr_free = free_holdings.get(pair, 0.0)
+                # If coins are locked by stale pending orders, cancel them to free balance
+                if curr_qty > curr_free:
+                    try:
+                        self.roostoo.cancel_order(pair=pair)
+                        time.sleep(0.2)
+                        b_resp = self.roostoo.get_balance()
+                        c_coin = pair.split("/")[0]
+                        curr_free = float(b_resp.get("Wallet", {}).get(c_coin, {}).get("Free", curr_free))
+                    except Exception as e:
+                        logger.debug(f"Note: Error cancelling pending order for {pair}: {e}")
+
                 sell_usd = abs(delta_usd)
                 sell_qty = sell_usd / curr_price
                 
-                # Apply AmountPrecision using FLOOR to guarantee never selling more than held
+                # Apply AmountPrecision using FLOOR strictly bounded by free quantity!
                 prec_info = exchange_info.get(pair, {})
                 amt_prec = prec_info.get("AmountPrecision", 4)
                 mini_order = prec_info.get("MiniOrder", 1.0)
                 
-                sell_qty_floored = min(curr_qty, floor_to_precision(sell_qty, amt_prec))
+                sell_qty_floored = min(curr_free, floor_to_precision(sell_qty, amt_prec))
                 if sell_qty_floored * curr_price >= mini_order and sell_qty_floored > 0:
-                    logger.info(f"Rebalance SELL: {sell_qty_floored} {pair} (~${sell_usd:.2f})")
+                    logger.info(f"Rebalance SELL: {sell_qty_floored} {pair} (~${sell_qty_floored*curr_price:.2f}) [Free: {curr_free}]")
                     resp = self.roostoo.place_order(pair=pair, side="SELL", quantity=sell_qty_floored, order_type="MARKET")
                     order_id = resp.get("OrderId", resp.get("Data", {}).get("OrderId", "mock_id"))
                     log_trade(
@@ -144,7 +158,7 @@ class PortfolioRebalancer:
         # 2. Second Pass: Buys & Short Entries
         # Refresh balance after sells
         time.sleep(1.0)
-        total_val, current_holdings = self._get_portfolio_value_and_holdings(exchange_info, tickers)
+        total_val, current_holdings, free_holdings = self._get_portfolio_value_and_holdings(exchange_info, tickers)
 
         for pair, target_w in decision.target_weights.items():
             if pair == "USD":
@@ -154,8 +168,7 @@ class PortfolioRebalancer:
             if curr_price <= 0:
                 continue
 
-            # CASE A: Negative target weight -> Open Short Position via /v6/short_open
-            # CRITICAL FIX: Check existing short collateral to prevent duplicate short stacking!
+            # CASE A: Negative target weight -> Open/Adjust Short Position via /v6/short_open
             if target_w < 0:
                 target_short_collateral = total_val * abs(target_w)
                 existing_collateral = active_shorts_map.get(pair, 0.0)
@@ -176,6 +189,26 @@ class PortfolioRebalancer:
                         order_id=order_id,
                         api_response=resp,
                         signal_reason=decision.rationales.get(pair, "Bear Market Short Hedge"),
+                        strategy_state={"regime": decision.regime, "target_weight": target_w}
+                    )
+                    time.sleep(0.3)
+                elif collateral_delta < -25.0 and existing_collateral > 0:
+                    # CRITICAL FIX: Scale down short when target short weight was reduced!
+                    reduce_collateral = abs(collateral_delta)
+                    close_pct = min(100.0, (reduce_collateral / existing_collateral) * 100.0)
+                    logger.info(
+                        f"Rebalance SHORT SCALE-DOWN: {pair} reducing short by ${reduce_collateral:.2f} "
+                        f"({close_pct:.1f}% close). (Target: ${target_short_collateral:.2f}, Existing: ${existing_collateral:.2f})"
+                    )
+                    c_resp = self.roostoo.short_close(pair=pair, close_pct=round(close_pct, 2))
+                    log_trade(
+                        symbol=pair,
+                        side="SHORT_CLOSE_PARTIAL",
+                        price=curr_price,
+                        quantity=reduce_collateral / max(curr_price, 1e-6),
+                        order_id="rebalance_short_scale_down",
+                        api_response=c_resp,
+                        signal_reason=f"Rebalance scale-down short to {target_w*100:.1f}%",
                         strategy_state={"regime": decision.regime, "target_weight": target_w}
                     )
                     time.sleep(0.3)

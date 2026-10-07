@@ -15,23 +15,38 @@ class DecisionEngine(BaseStrategy):
 
     def calculate_expected_value(self, metric: AssetMetrics) -> float:
         """
-        Calculates Net Mathematical Expectancy:
-        E[R_net] = P(Win) * R_win - P(Loss) * R_loss - Friction
+        Calculates Realistic Multi-Outcome Net Mathematical Expectancy:
+        E[R_net] = P(Win) * E[R_win] - P(Loss) * E[R_loss] - Friction
+        
+        Calibrated to the bot's dynamic lifecycle:
+        - Big Runner (Trailing Stop): E[R] ~ +5.2%
+        - Profit Ratchet (Breakeven): E[R] ~ +0.40%
+        - Cycle Rotation / Drift: E[R] ~ +1.0%
+        - Controlled Stop / Decay: E[R] ~ -1.6%
         """
-        # Base win probability calibrated by empirical order flow findings:
-        # P(Win) increases linearly with informed taker buy volume
+        # Multi-factor probabilistic calibration:
+        # High-tier quant hedge funds achieve directional win rates bounded between 45% and 58%.
         tb_fraction = metric.taker_buy_4h_pct / 100.0
-        p_win = min(0.75, max(0.40, 0.50 + 0.50 * (tb_fraction - 0.50)))
+        trend_factor = 0.02 if metric.return_4h_pct > 0 else -0.02
+        alpha_factor = 0.02 if metric.residual_alpha_pct > 0 else -0.01
+
+        p_win = min(0.60, max(0.42, 0.48 + 0.40 * (tb_fraction - 0.50) + trend_factor + alpha_factor))
         p_loss = 1.0 - p_win
 
-        # Volatility-adjusted target win/loss based on asset ATR:
-        # Standard swing targets are 4.0% win and 2.0% loss (matching Trailing Stop and Ratchet triggers).
-        # For high-volatility assets (e.g. meme coins), targets scale up proportionally.
         vol_scale = max(1.0, metric.atr_15m_pct / 0.8) if metric.atr_15m_pct > 0 else 1.0
-        target_win_pct = 4.0 * vol_scale
-        target_loss_pct = 2.0 * vol_scale
 
-        ev_net = (p_win * target_win_pct) - (p_loss * target_loss_pct) - self.friction_pct
+        # Weighted expectation of winning trades:
+        # 45% runners, 35% ratchets, 20% rebalance drift
+        r_runner = (settings.TRAILING_STOP_TRIGGER_PCT + settings.TRAILING_STOP_OFFSET_PCT) * vol_scale  # ~5.2%
+        r_ratchet = settings.PROFIT_RATCHET_LOCK_PCT                                                    # +0.40%
+        r_drift = 1.0 * vol_scale                                                                       # +1.0%
+        expected_win_payoff = (0.45 * r_runner) + (0.35 * r_ratchet) + (0.20 * r_drift)
+
+        # Expected loss of losing trades:
+        # Exited early via momentum decay cut (-1.2%) or hard stop (-2.5%)
+        expected_loss_payoff = 1.60 * vol_scale
+
+        ev_net = (p_win * expected_win_payoff) - (p_loss * expected_loss_payoff) - self.friction_pct
         return round(ev_net, 3)
 
     def evaluate(self, snapshot: MarketSnapshot, portfolio_state: Dict[str, Any]) -> StrategyDecision:
@@ -39,34 +54,51 @@ class DecisionEngine(BaseStrategy):
         rationales: Dict[str, str] = {}
         expected_returns: Dict[str, float] = {}
 
-        # --- COMPOSITE MULTI-FACTOR REGIME CLASSIFIER ---
+        # --- CONTINUOUS COMPOSITE MARKET HEALTH SCORE (0 to 100) ---
         btc_metric = snapshot.assets.get("BTCUSDT")
         btc_12h = btc_metric.return_12h_pct if btc_metric else 0.0
+        btc_tb = snapshot.btc_taker_buy_pct
 
-        # Factor 1: Trend Alignment (BTC vs EMA20)
-        trend_bullish = snapshot.btc_above_ema20
+        # Factor 1: Trend Alignment (0 to 25 pts)
+        score_trend = 25.0 if snapshot.btc_above_ema20 else 5.0
 
-        # Factor 2: Order Flow Conviction (Taker Buy Ratio)
-        orderflow_healthy = snapshot.btc_taker_buy_pct >= 47.0
+        # Factor 2: Momentum Velocity (0 to 35 pts)
+        if btc_12h >= 2.0:
+            score_momentum = 35.0
+        elif btc_12h >= 0.0:
+            score_momentum = 15.0 + (btc_12h / 2.0) * 20.0
+        elif btc_12h >= -1.5:
+            score_momentum = 5.0 + ((btc_12h + 1.5) / 1.5) * 10.0
+        else:
+            score_momentum = 0.0
 
-        # Factor 3: Volatility Environment (Normal ATR vs Liquidation Cascade)
-        volatility_stable = snapshot.btc_atr_normal
+        # Factor 3: Order Flow Conviction (0 to 25 pts)
+        if btc_tb >= 54.0:
+            score_orderflow = 25.0
+        elif btc_tb >= 50.0:
+            score_orderflow = 15.0 + ((btc_tb - 50.0) / 4.0) * 10.0
+        elif btc_tb >= 45.0:
+            score_orderflow = 5.0 + ((btc_tb - 45.0) / 5.0) * 10.0
+        else:
+            score_orderflow = max(0.0, ((btc_tb - 40.0) / 5.0) * 5.0)
 
-        # Factor 4: Momentum Velocity (12h Return)
-        momentum_positive = btc_12h > 0.8
+        # Factor 4: Volatility Environment (0 to 10 pts)
+        score_volatility = 10.0 if snapshot.btc_atr_normal else 0.0
 
-        # --- REGIME DETERMINATION ---
-        if not trend_bullish or not volatility_stable or btc_12h < -1.5 or snapshot.btc_taker_buy_pct < 45.0:
+        market_health_score = score_trend + score_momentum + score_orderflow + score_volatility
+
+        # Smooth Continuous Regime Transition (Eliminates Boolean Cliff Edges)
+        if market_health_score < settings.REGIME_BEAR_SCORE_THRESHOLD:
             regime = "BEAR_CONTRACTION"
-        elif trend_bullish and momentum_positive and orderflow_healthy:
+        elif market_health_score > settings.REGIME_BULL_SCORE_THRESHOLD:
             regime = "BULL_EXPANSION"
         else:
             regime = "SIDEWAYS_STABILITY"
 
         logger.info(
-            f"[REGIME CLASSIFIER] Classified Market as: {regime} | "
-            f"BTC>EMA20: {trend_bullish} | 12h Ret: {btc_12h:+.2f}% | "
-            f"TakerBuy: {snapshot.btc_taker_buy_pct:.1f}% | VolStable: {volatility_stable}"
+            f"[REGIME CLASSIFIER] Classified Market as: {regime} | HealthScore: {market_health_score:.1f}/100 | "
+            f"BTC>EMA20: {snapshot.btc_above_ema20} | 12h Ret: {btc_12h:+.2f}% | "
+            f"TakerBuy: {btc_tb:.1f}% | VolStable: {snapshot.btc_atr_normal}"
         )
 
         # =========================================================================

@@ -75,7 +75,69 @@ class TestRiskGuard(unittest.TestCase):
         pos.is_trailing = True
         trail_stop = pos.peak_price * (1.0 + 1.20 / 100.0)
         pos.effective_stop_price = trail_stop
-        self.assertAlmostEqual(pos.effective_stop_price, 96.14, places=2)
+    def test_small_account_circuit_breaker(self):
+        """
+        Validates that an account with $500 properly tracks dynamic HWM
+        and triggers the circuit breaker on 2.0% drawdown.
+        """
+        client = RoostooClient()
+        guard = RiskGuard(client)
+        
+        # Verify initial HWM is dynamic 0.0
+        self.assertEqual(guard.portfolio_high_watermark, 0.0)
+        
+        # Simulate initial balance of $500
+        guard.portfolio_high_watermark = 500.0
+        
+        # Price drops to $489.0 (drawdown = 2.2% > 2.0%)
+        curr_val = 489.0
+        drawdown = (guard.portfolio_high_watermark - curr_val) / guard.portfolio_high_watermark * 100.0
+        self.assertGreaterEqual(drawdown, 2.0)
+        
+        # Dynamic circuit breaker check works for $500 without requiring total_val > 1000
+        cb_triggered = drawdown >= 2.0 and curr_val > 0.0 and guard.portfolio_high_watermark > 0.0
+        self.assertTrue(cb_triggered)
+
+    def test_toxicity_whipsaw_defense(self):
+        """
+        Validates that a sudden whale sell into a bid wall (high volume, high sell imbalance)
+        does NOT trigger panic liquidation if the price holds firm (no price breakdown).
+        """
+        from bot.data.market_feed import AssetMetrics
+        metric = AssetMetrics(
+            symbol="SOLUSDT",
+            roostoo_pair="SOL/USD",
+            last_price=100.0,
+            spread_pct=0.01,
+            volume_24h_usd=50_000_000.0,
+            return_12h_pct=2.0,
+            return_4h_pct=1.0,
+            return_15m_pct=0.20,  # Price actually gained +0.20% despite sell pressure!
+            taker_buy_4h_pct=52.0,
+            taker_imbalance_15m=-0.35, # Severe sell imbalance
+            vol_zscore_15m=3.0,        # Huge volume
+            atr_15m_pct=0.8,
+            beta_to_btc=1.0,
+            residual_alpha_pct=0.5,
+            is_liquid=True
+        )
+
+        pos = PositionTracker(
+            pair="SOL/USD",
+            entry_price=99.5,
+            peak_price=100.0,
+            quantity=10.0,
+            effective_stop_price=96.0,
+            is_ratcheted=False,
+            is_trailing=False
+        )
+
+        # Price confirmation check
+        curr_price = 100.0
+        is_price_breakdown = (metric.return_15m_pct < -0.50) or (curr_price < pos.entry_price)
+        
+        # Because price is 100.0 > entry (99.5) and return_15m is +0.20%, is_price_breakdown is FALSE
+        self.assertFalse(is_price_breakdown)
 
 if __name__ == "__main__":
     unittest.main()

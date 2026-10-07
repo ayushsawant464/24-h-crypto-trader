@@ -37,7 +37,7 @@ class RiskGuard:
     def __init__(self, roostoo_client: RoostooClient):
         self.roostoo = roostoo_client
         self.active_positions: Dict[str, PositionTracker] = {}
-        self.portfolio_high_watermark: float = 100000.0
+        self.portfolio_high_watermark: float = 0.0  # Initialized dynamically on first audit
         self.circuit_breaker_active: bool = False
         self.circuit_breaker_until: float = 0.0
 
@@ -165,12 +165,14 @@ class RiskGuard:
                 p = tickers.get(f"{coin}/USD", {}).get("LastPrice", 0.0)
                 total_val += (qty * p)
 
-        if total_val > self.portfolio_high_watermark:
+        if self.portfolio_high_watermark <= 0.0 and total_val > 0.0:
+            self.portfolio_high_watermark = total_val
+        elif total_val > self.portfolio_high_watermark:
             self.portfolio_high_watermark = total_val
 
-        # Circuit Breaker Check
-        drawdown_pct = (self.portfolio_high_watermark - total_val) / max(self.portfolio_high_watermark, 1.0) * 100
-        if drawdown_pct >= settings.PORTFOLIO_CIRCUIT_BREAKER_PCT and total_val > 1000:
+        # Circuit Breaker Check (dynamic calibration for any portfolio size)
+        drawdown_pct = ((self.portfolio_high_watermark - total_val) / self.portfolio_high_watermark * 100.0) if self.portfolio_high_watermark > 0.0 else 0.0
+        if drawdown_pct >= settings.PORTFOLIO_CIRCUIT_BREAKER_PCT and total_val > 0.0 and self.portfolio_high_watermark > 0.0:
             logger.critical(
                 f"[PORTFOLIO CIRCUIT BREAKER TRIGGERED] Drawdown: {drawdown_pct:.2f}% >= {settings.PORTFOLIO_CIRCUIT_BREAKER_PCT}%. "
                 f"Emergency liquidation of 100% capital into USD Cash!"
@@ -222,14 +224,31 @@ class RiskGuard:
                             f"Trailing stop ratcheted to ${trail_stop:,.4f}"
                         )
 
-                # Check Order Flow Toxicity Emergency Exit (Whale Dump)
-                if metric and metric.taker_imbalance_15m < -0.25 and metric.vol_zscore_15m > 2.5:
-                    logger.warning(
-                        f"[TOXICITY EXIT] {pos.pair} detected extreme order flow toxicity "
-                        f"(Imbalance: {metric.taker_imbalance_15m:.2f}, Vol Z: {metric.vol_zscore_15m:.1f}). Emergency sell!"
-                    )
-                    self._execute_stop_sell(pos.pair, pos, curr_price, snapshot.exchange_info, reason="Toxicity Emergency Exit")
-                    continue
+                # Check Order Flow Toxicity Emergency Exit with Price Confirmation (Anti Whip-Saw)
+                if metric and metric.taker_imbalance_15m < settings.TOXICITY_IMBALANCE_THRESHOLD and metric.vol_zscore_15m > 2.5:
+                    is_price_breakdown = (metric.return_15m_pct < -settings.TOXICITY_PRICE_DROP_CONFIRMATION_PCT) or (curr_price < pos.entry_price)
+                    if is_price_breakdown:
+                        logger.warning(
+                            f"[TOXICITY EXIT CONFIRMED] {pos.pair} detected toxic dump with price breakdown "
+                            f"(Imbalance: {metric.taker_imbalance_15m:.2f}, Vol Z: {metric.vol_zscore_15m:.1f}, 15m Ret: {metric.return_15m_pct:.2f}%). Emergency sell!"
+                        )
+                        self._execute_stop_sell(pos.pair, pos, curr_price, snapshot.exchange_info, reason="Toxicity Breakdown Emergency Exit")
+                        continue
+                    else:
+                        logger.info(
+                            f"[TOXICITY ABSORPTION] {pos.pair} high sell imbalance ({metric.taker_imbalance_15m:.2f}) "
+                            f"absorbed by bid wall (15m Ret: {metric.return_15m_pct:+.2f}%). Avoiding whip-saw panic exit."
+                        )
+
+                # Check Early Momentum Decay Exit (prevents riding failing tokens into full 3.5% stop)
+                if metric and metric.return_4h_pct < -1.5 and metric.taker_buy_4h_pct < 46.0:
+                    if curr_price < pos.entry_price * (1.0 - settings.EARLY_MOMENTUM_DECAY_PCT / 100.0):
+                        logger.warning(
+                            f"[EARLY MOMENTUM DECAY EXIT] {pos.pair} momentum decaying (4h Ret: {metric.return_4h_pct:+.2f}%, "
+                            f"Taker Buy: {metric.taker_buy_4h_pct:.1f}%). Cutting position early to protect capital!"
+                        )
+                        self._execute_stop_sell(pos.pair, pos, curr_price, snapshot.exchange_info, reason="Early Momentum Decay Cut")
+                        continue
 
                 # Check Stop-Loss Execution
                 if curr_price <= pos.effective_stop_price:
@@ -271,14 +290,18 @@ class RiskGuard:
                             f"Short trailing stop ratcheted to ${trail_stop:,.4f}"
                         )
 
-                # Check Short Squeeze Toxicity Exit (Whales aggressively absorbing buy side)
+                # Check Short Squeeze Toxicity Exit with Price Confirmation
                 if metric and metric.taker_imbalance_15m > 0.25 and metric.vol_zscore_15m > 2.5:
-                    logger.warning(
-                        f"[SHORT SQUEEZE TOXICITY EXIT] {pos.pair} detected aggressive buying volume "
-                        f"(Imbalance: {metric.taker_imbalance_15m:+.2f}, Vol Z: {metric.vol_zscore_15m:.1f}). Emergency closing short!"
-                    )
-                    self._execute_short_close(pos.pair, pos, curr_price, reason="Short Squeeze Emergency Exit")
-                    continue
+                    is_squeeze_spike = (metric.return_15m_pct > settings.TOXICITY_PRICE_DROP_CONFIRMATION_PCT) or (curr_price > pos.entry_price)
+                    if is_squeeze_spike:
+                        logger.warning(
+                            f"[SHORT SQUEEZE EXIT CONFIRMED] {pos.pair} detected aggressive buying volume and price breakout "
+                            f"(Imbalance: {metric.taker_imbalance_15m:+.2f}, Vol Z: {metric.vol_zscore_15m:.1f}, 15m Ret: {metric.return_15m_pct:+.2f}%). Emergency closing short!"
+                        )
+                        self._execute_short_close(pos.pair, pos, curr_price, reason="Short Squeeze Emergency Exit")
+                        continue
+                    else:
+                        logger.info(f"[SHORT SQUEEZE RESISTANCE] {pos.pair} buyer spike absorbed by ask wall. Holding short.")
 
                 # Check Short Stop-Loss Execution (Price rallies above stop)
                 if curr_price >= pos.effective_stop_price:
@@ -293,20 +316,37 @@ class RiskGuard:
 
     def _execute_stop_sell(self, pair: str, pos: PositionTracker, price: float, exchange_info: Dict[str, Any], reason: str):
         amt_prec = exchange_info.get(pair, {}).get("AmountPrecision", 4)
-        sell_qty = floor_to_precision(pos.quantity, amt_prec)
-        resp = self.roostoo.place_order(pair=pair, side="SELL", quantity=sell_qty, order_type="MARKET")
-        order_id = resp.get("OrderId", resp.get("Data", {}).get("OrderId", "mock_id"))
-        pnl_pct = (price - pos.entry_price) / pos.entry_price * 100.0
-        log_trade(
-            symbol=pair,
-            side="SELL",
-            price=price,
-            quantity=sell_qty,
-            order_id=order_id,
-            api_response=resp,
-            signal_reason=f"{reason} | PnL: {pnl_pct:+.2f}%",
-            pnl=round(pnl_pct, 2)
-        )
+        mini_order = exchange_info.get(pair, {}).get("MiniOrder", 1.0)
+        
+        # Verify strictly available free wallet balance to avoid Insufficient Balance error
+        curr_free = pos.quantity
+        try:
+            b_resp = self.roostoo.get_balance()
+            c_coin = pair.split("/")[0]
+            curr_free = float(b_resp.get("Wallet", {}).get(c_coin, {}).get("Free", pos.quantity))
+            if curr_free < pos.quantity * 0.95:  # Balance locked by pending order
+                self.roostoo.cancel_order(pair=pair)
+                time.sleep(0.2)
+                b_resp = self.roostoo.get_balance()
+                curr_free = float(b_resp.get("Wallet", {}).get(c_coin, {}).get("Free", curr_free))
+        except Exception as e:
+            logger.debug(f"Note: Error checking free balance for stop sell on {pair}: {e}")
+
+        sell_qty = min(curr_free, floor_to_precision(pos.quantity, amt_prec))
+        if sell_qty * price >= mini_order and sell_qty > 0:
+            resp = self.roostoo.place_order(pair=pair, side="SELL", quantity=sell_qty, order_type="MARKET")
+            order_id = resp.get("OrderId", resp.get("Data", {}).get("OrderId", "mock_id"))
+            pnl_pct = (price - pos.entry_price) / pos.entry_price * 100.0
+            log_trade(
+                symbol=pair,
+                side="SELL",
+                price=price,
+                quantity=sell_qty,
+                order_id=order_id,
+                api_response=resp,
+                signal_reason=f"{reason} | PnL: {pnl_pct:+.2f}%",
+                pnl=round(pnl_pct, 2)
+            )
         if pair in self.active_positions:
             del self.active_positions[pair]
 
