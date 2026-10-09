@@ -108,7 +108,12 @@ class RiskGuard:
         Uses adaptive ATR stops and preserves historical entry prices across restarts.
         """
         balance_resp = self.roostoo.get_balance()
-        wallet = balance_resp.get("SpotWallet") or balance_resp.get("Wallet") or {}
+        wallet = (
+            balance_resp.get("SpotWallet") or 
+            balance_resp.get("Wallet") or 
+            balance_resp.get("Data", {}).get("SpotWallet") or 
+            balance_resp.get("Data", {}).get("Wallet") or {}
+        )
 
         current_pairs = set()
         for coin, val in wallet.items():
@@ -337,60 +342,62 @@ class RiskGuard:
 
         # 3. Audit Individual Open Positions (Long and Short)
         for key, pos in list(self.active_positions.items()):
-            curr_price = tickers.get(pos.pair, {}).get("LastPrice", 0.0)
-            if curr_price <= 0:
-                continue
+            try:
+                curr_price = tickers.get(pos.pair, {}).get("LastPrice", 0.0)
+                if curr_price <= 0:
+                    continue
 
-            sym = pos.pair.replace("/USD", "USDT")
-            metric = snapshot.assets.get(sym)
+                sym = pos.pair.replace("/USD", "USDT")
+                metric = snapshot.assets.get(sym)
 
-            # ==========================================
-            # AUDIT CASE A: SPOT LONG POSITION
-            # ==========================================
-            if pos.side == "LONG":
-                gain_pct = (curr_price - pos.entry_price) / pos.entry_price * 100.0
-                
-                # Intra-Period Peak Tracking: Stream candle high to catch violent wicks between 60s ticks
-                candle_high = metric.high_15m if (metric and metric.high_15m > 0) else curr_price
-                if candle_high > pos.peak_price:
-                    pos.peak_price = candle_high
-                if curr_price > pos.peak_price:
-                    pos.peak_price = curr_price
+                # ==========================================
+                # AUDIT CASE A: SPOT LONG POSITION
+                # ==========================================
+                if pos.side == "LONG":
+                    gain_pct = (curr_price - pos.entry_price) / pos.entry_price * 100.0
+                    
+                    # Intra-Period Peak Tracking: Stream candle high to catch violent wicks between 60s ticks
+                    candle_high = metric.high_15m if (metric and metric.high_15m > 0) else curr_price
+                    if candle_high > pos.peak_price:
+                        pos.peak_price = candle_high
+                    if curr_price > pos.peak_price:
+                        pos.peak_price = curr_price
 
-                # Check Stage 1: Breakeven Profit Ratchet (+2.0% -> +0.4%)
-                if gain_pct >= settings.PROFIT_RATCHET_TRIGGER_PCT and not pos.is_ratcheted:
-                    new_stop = pos.entry_price * (1.0 + settings.PROFIT_RATCHET_LOCK_PCT / 100.0)
-                    if new_stop > pos.effective_stop_price:
-                        pos.effective_stop_price = new_stop
-                        pos.is_ratcheted = True
-                        self._persist_position(pos)
-                        logger.info(
-                            f"[PROFIT RATCHET LONG] {pos.pair} gained +{gain_pct:.2f}%. "
-                            f"Stop ratcheted to Breakeven (+0.4% fees covered): ${new_stop:,.4f}"
-                        )
+                    # Check Stage 1: Breakeven Profit Ratchet (+2.0% -> +0.4%)
+                    if gain_pct >= settings.PROFIT_RATCHET_TRIGGER_PCT and not pos.is_ratcheted:
+                        new_stop = pos.entry_price * (1.0 + settings.PROFIT_RATCHET_LOCK_PCT / 100.0)
+                        if new_stop > pos.effective_stop_price:
+                            pos.effective_stop_price = new_stop
+                            pos.is_ratcheted = True
+                            self._persist_position(pos)
+                            logger.info(
+                                f"[PROFIT RATCHET LONG] {pos.pair} gained +{gain_pct:.2f}%. "
+                                f"Stop ratcheted to Breakeven (+0.4% fees covered): ${new_stop:,.4f}"
+                            )
 
-                # Check Stage 2: Trailing Stop Lock (+4.0% -> Peak - 1.2%)
-                if gain_pct >= settings.TRAILING_STOP_TRIGGER_PCT:
-                    pos.is_trailing = True
-                    trail_stop = pos.peak_price * (1.0 - settings.TRAILING_STOP_OFFSET_PCT / 100.0)
-                    if trail_stop > pos.effective_stop_price:
-                        pos.effective_stop_price = trail_stop
-                        self._persist_position(pos)
-                        logger.info(
-                            f"[TRAILING STOP LONG] {pos.pair} peak ${pos.peak_price:,.4f}. "
-                            f"Trailing stop ratcheted to ${trail_stop:,.4f}"
-                        )
+                    # Check Stage 2: Trailing Stop Lock (+4.0% -> Peak - 1.2%)
+                    if gain_pct >= settings.TRAILING_STOP_TRIGGER_PCT:
+                        pos.is_trailing = True
+                        trail_stop = pos.peak_price * (1.0 - settings.TRAILING_STOP_OFFSET_PCT / 100.0)
+                        if trail_stop > pos.effective_stop_price:
+                            pos.effective_stop_price = trail_stop
+                            self._persist_position(pos)
+                            logger.info(
+                                f"[TRAILING STOP LONG] {pos.pair} peak ${pos.peak_price:,.4f}. "
+                                f"Trailing stop ratcheted to ${trail_stop:,.4f}"
+                            )
 
-                # Check Order Flow Toxicity Emergency Exit with Price Confirmation (Anti Whip-Saw)
-                if metric and metric.taker_imbalance_15m < settings.TOXICITY_IMBALANCE_THRESHOLD and metric.vol_zscore_15m > 2.5:
-                    is_price_breakdown = (metric.return_15m_pct < -settings.TOXICITY_PRICE_DROP_CONFIRMATION_PCT) or (curr_price < pos.entry_price)
-                    if is_price_breakdown:
-                        logger.warning(
-                            f"[TOXICITY EXIT CONFIRMED] {pos.pair} detected toxic dump with price breakdown "
-                            f"(Imbalance: {metric.taker_imbalance_15m:.2f}, Vol Z: {metric.vol_zscore_15m:.1f}, 15m Ret: {metric.return_15m_pct:.2f}%). Emergency sell!"
-                        )
-                        self._execute_stop_sell(pos.pair, pos, curr_price, snapshot.exchange_info, reason="Toxicity Breakdown Emergency Exit")
-                        continue
+                    # Check Order Flow Toxicity Emergency Exit with Price Confirmation (Anti Whip-Saw)
+                    toxicity_thresh = getattr(settings, "TOXICITY_IMBALANCE_THRESHOLD", -0.25)
+                    if metric and metric.taker_imbalance_15m < toxicity_thresh and metric.vol_zscore_15m > 2.5:
+                        is_price_breakdown = (metric.return_15m_pct < -settings.TOXICITY_PRICE_DROP_CONFIRMATION_PCT) or (curr_price < pos.entry_price)
+                        if is_price_breakdown:
+                            logger.warning(
+                                f"[TOXICITY EXIT CONFIRMED] {pos.pair} detected toxic dump with price breakdown "
+                                f"(Imbalance: {metric.taker_imbalance_15m:.2f}, Vol Z: {metric.vol_zscore_15m:.1f}, 15m Ret: {metric.return_15m_pct:.2f}%). Emergency sell!"
+                            )
+                            self._execute_stop_sell(pos.pair, pos, curr_price, snapshot.exchange_info, reason="Toxicity Breakdown Emergency Exit")
+                            continue
                     else:
                         logger.info(
                             f"[TOXICITY ABSORPTION] {pos.pair} high sell imbalance ({metric.taker_imbalance_15m:.2f}) "
@@ -425,74 +432,76 @@ class RiskGuard:
                         )
                         self._execute_stop_sell(pos.pair, pos, curr_price, snapshot.exchange_info, reason=loss_or_gain)
 
-            # ==========================================
-            # AUDIT CASE B: SHORT POSITION
-            # ==========================================
-            elif pos.side == "SHORT":
-                # For a short, gain increases as price falls
-                gain_pct = (pos.entry_price - curr_price) / pos.entry_price * 100.0
+                # ==========================================
+                # AUDIT CASE B: SHORT POSITION
+                # ==========================================
+                elif pos.side == "SHORT":
+                    # For a short, gain increases as price falls
+                    gain_pct = (pos.entry_price - curr_price) / pos.entry_price * 100.0
 
-                # Intra-Period Trough Tracking: Stream candle low to catch violent dips
-                candle_low = metric.low_15m if (metric and metric.low_15m > 0) else curr_price
-                if candle_low < pos.peak_price:
-                    pos.peak_price = candle_low
-                if curr_price < pos.peak_price:
-                    pos.peak_price = curr_price  # Track lowest price achieved
+                    # Intra-Period Trough Tracking: Stream candle low to catch violent dips
+                    candle_low = metric.low_15m if (metric and metric.low_15m > 0) else curr_price
+                    if candle_low < pos.peak_price:
+                        pos.peak_price = candle_low
+                    if curr_price < pos.peak_price:
+                        pos.peak_price = curr_price  # Track lowest price achieved
 
-                # Check Stage 1: Breakeven Profit Ratchet for Short (+2.0% drop -> lock +0.4%)
-                if gain_pct >= settings.PROFIT_RATCHET_TRIGGER_PCT and not pos.is_ratcheted:
-                    new_stop = pos.entry_price * (1.0 - settings.PROFIT_RATCHET_LOCK_PCT / 100.0)
-                    if new_stop < pos.effective_stop_price:
-                        pos.effective_stop_price = new_stop
-                        pos.is_ratcheted = True
-                        self._persist_position(pos)
-                        logger.info(
-                            f"[PROFIT RATCHET SHORT] {pos.pair} price dropped {gain_pct:.2f}%. "
-                            f"Short stop ratcheted to lock profit (+0.4% fees covered): ${new_stop:,.4f}"
-                        )
+                    # Check Stage 1: Breakeven Profit Ratchet for Short (+2.0% drop -> lock +0.4%)
+                    if gain_pct >= settings.PROFIT_RATCHET_TRIGGER_PCT and not pos.is_ratcheted:
+                        new_stop = pos.entry_price * (1.0 - settings.PROFIT_RATCHET_LOCK_PCT / 100.0)
+                        if new_stop < pos.effective_stop_price:
+                            pos.effective_stop_price = new_stop
+                            pos.is_ratcheted = True
+                            self._persist_position(pos)
+                            logger.info(
+                                f"[PROFIT RATCHET SHORT] {pos.pair} price dropped {gain_pct:.2f}%. "
+                                f"Short stop ratcheted to lock profit (+0.4% fees covered): ${new_stop:,.4f}"
+                            )
 
-                # Check Stage 2: Trailing Stop Lock for Short (+4.0% drop -> trail 1.2% above low)
-                if gain_pct >= settings.TRAILING_STOP_TRIGGER_PCT:
-                    pos.is_trailing = True
-                    trail_stop = pos.peak_price * (1.0 + settings.TRAILING_STOP_OFFSET_PCT / 100.0)
-                    if trail_stop < pos.effective_stop_price:
-                        pos.effective_stop_price = trail_stop
-                        self._persist_position(pos)
-                        logger.info(
-                            f"[TRAILING STOP SHORT] {pos.pair} reached low ${pos.peak_price:,.4f}. "
-                            f"Short trailing stop ratcheted to ${trail_stop:,.4f}"
-                        )
+                    # Check Stage 2: Trailing Stop Lock for Short (+4.0% drop -> trail 1.2% above low)
+                    if gain_pct >= settings.TRAILING_STOP_TRIGGER_PCT:
+                        pos.is_trailing = True
+                        trail_stop = pos.peak_price * (1.0 + settings.TRAILING_STOP_OFFSET_PCT / 100.0)
+                        if trail_stop < pos.effective_stop_price:
+                            pos.effective_stop_price = trail_stop
+                            self._persist_position(pos)
+                            logger.info(
+                                f"[TRAILING STOP SHORT] {pos.pair} reached low ${pos.peak_price:,.4f}. "
+                                f"Short trailing stop ratcheted to ${trail_stop:,.4f}"
+                            )
 
-                # Check Short Squeeze Toxicity Exit with Price Confirmation
-                if metric and metric.taker_imbalance_15m > 0.25 and metric.vol_zscore_15m > 2.5:
-                    is_squeeze_spike = (metric.return_15m_pct > settings.TOXICITY_PRICE_DROP_CONFIRMATION_PCT) or (curr_price > pos.entry_price)
-                    if is_squeeze_spike:
-                        logger.warning(
-                            f"[SHORT SQUEEZE EXIT CONFIRMED] {pos.pair} detected aggressive buying volume and price breakout "
-                            f"(Imbalance: {metric.taker_imbalance_15m:+.2f}, Vol Z: {metric.vol_zscore_15m:.1f}, 15m Ret: {metric.return_15m_pct:+.2f}%). Emergency closing short!"
-                        )
-                        self._execute_short_close(pos.pair, pos, curr_price, reason="Short Squeeze Emergency Exit")
-                        continue
-                    else:
-                        logger.info(f"[SHORT SQUEEZE RESISTANCE] {pos.pair} buyer spike absorbed by ask wall. Holding short.")
+                    # Check Short Squeeze Toxicity Exit with Price Confirmation
+                    if metric and metric.taker_imbalance_15m > 0.25 and metric.vol_zscore_15m > 2.5:
+                        is_squeeze_spike = (metric.return_15m_pct > settings.TOXICITY_PRICE_DROP_CONFIRMATION_PCT) or (curr_price > pos.entry_price)
+                        if is_squeeze_spike:
+                            logger.warning(
+                                f"[SHORT SQUEEZE EXIT CONFIRMED] {pos.pair} detected aggressive buying volume and price breakout "
+                                f"(Imbalance: {metric.taker_imbalance_15m:+.2f}, Vol Z: {metric.vol_zscore_15m:.1f}, 15m Ret: {metric.return_15m_pct:+.2f}%). Emergency closing short!"
+                            )
+                            self._execute_short_close(pos.pair, pos, curr_price, reason="Short Squeeze Emergency Exit")
+                            continue
+                        else:
+                            logger.info(f"[SHORT SQUEEZE RESISTANCE] {pos.pair} buyer spike absorbed by ask wall. Holding short.")
 
-                # Check Short Stop-Loss Execution with Single-Tick Ask-Wall Defense
-                if curr_price >= pos.effective_stop_price:
-                    tick_info = tickers.get(pos.pair, {})
-                    ask_p = tick_info.get("AskPrice", curr_price)
-                    # If Ask price is still below stop price, treat as transient single-tick wick anomaly
-                    if ask_p < pos.effective_stop_price and curr_price >= pos.effective_stop_price:
-                        logger.info(
-                            f"[STOP DEFENSE SHORT] {pos.pair} last price ${curr_price:,.4f} wicked above stop ${pos.effective_stop_price:,.4f}, "
-                            f"but Ask is ${ask_p:,.4f}. Holding short."
-                        )
-                    else:
-                        loss_or_gain = "Short Stop-Loss" if curr_price > pos.entry_price else "Short Trailing Take-Profit"
-                        logger.warning(
-                            f"[{loss_or_gain.upper()} TRIGGERED] {pos.pair} Price: ${curr_price:,.4f} >= Stop: ${pos.effective_stop_price:,.4f}. "
-                            f"Executing immediate short position close!"
-                        )
-                        self._execute_short_close(pos.pair, pos, curr_price, reason=loss_or_gain)
+                    # Check Short Stop-Loss Execution with Single-Tick Ask-Wall Defense
+                    if curr_price >= pos.effective_stop_price:
+                        tick_info = tickers.get(pos.pair, {})
+                        ask_p = tick_info.get("AskPrice", curr_price)
+                        # If Ask price is still below stop price, treat as transient single-tick wick anomaly
+                        if ask_p < pos.effective_stop_price and curr_price >= pos.effective_stop_price:
+                            logger.info(
+                                f"[STOP DEFENSE SHORT] {pos.pair} last price ${curr_price:,.4f} wicked above stop ${pos.effective_stop_price:,.4f}, "
+                                f"but Ask is ${ask_p:,.4f}. Holding short."
+                            )
+                        else:
+                            loss_or_gain = "Short Stop-Loss" if curr_price > pos.entry_price else "Short Trailing Take-Profit"
+                            logger.warning(
+                                f"[{loss_or_gain.upper()} TRIGGERED] {pos.pair} Price: ${curr_price:,.4f} >= Stop: ${pos.effective_stop_price:,.4f}. "
+                                f"Executing immediate short position close!"
+                            )
+                            self._execute_short_close(pos.pair, pos, curr_price, reason=loss_or_gain)
+            except Exception as pos_err:
+                logger.exception(f"[RISK GUARD ERROR] Error auditing position {pos.pair}: {pos_err}")
 
         return {"Status": "OK", "ActivePositions": len(self.active_positions)}
 

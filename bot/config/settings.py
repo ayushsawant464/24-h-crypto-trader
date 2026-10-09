@@ -51,6 +51,10 @@ class Settings:
     # Continuous Regime Classifier Thresholds (Market Health Score 0 to 100)
     REGIME_BULL_SCORE_THRESHOLD: float = 65.0   # Score > 65: Bull Expansion
     REGIME_BEAR_SCORE_THRESHOLD: float = 38.0   # Score < 38: Bear Contraction
+    REGIME_BEAR_ENTER_THRESHOLD: float = 35.0   # Hysteresis: Must drop below 35 to enter Bear
+    REGIME_BEAR_EXIT_THRESHOLD: float = 42.0    # Hysteresis: Must rise above 42 to exit Bear
+    REGIME_BULL_ENTER_THRESHOLD: float = 66.0   # Hysteresis: Must exceed 66 to enter Bull
+    REGIME_BULL_EXIT_THRESHOLD: float = 60.0    # Hysteresis: Drops below 60 to exit Bull
     
     # Decision Gates Thresholds
     MIN_24H_VOL_USD: float = 5_000_000.0        # Gate 2: Liquidity filter
@@ -59,6 +63,7 @@ class Settings:
     MIN_EXPECTED_NET_RETURN_PCT: float = 0.20   # Core Hurdle: Realistic Multi-Outcome Net Expectancy (20 bps)
     
     # Toxicity Confirmation & Early Momentum Decay Thresholds
+    TOXICITY_IMBALANCE_THRESHOLD: float = -0.25         # Gate: 15m sell imbalance threshold for dump detection
     TOXICITY_PRICE_DROP_CONFIRMATION_PCT: float = 0.50  # Must see active price drop to confirm dump
     EARLY_MOMENTUM_DECAY_PCT: float = 1.20              # Cut deteriorating positions before full 3.5% stop
     

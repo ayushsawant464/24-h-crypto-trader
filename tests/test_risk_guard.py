@@ -80,9 +80,13 @@ class TestRiskGuard(unittest.TestCase):
         Validates that an account with $500 properly tracks dynamic HWM
         and triggers the circuit breaker on 5.0% drawdown.
         """
+        from unittest.mock import MagicMock
         from bot.config.settings import settings
         client = RoostooClient()
-        guard = RiskGuard(client)
+        mock_state = MagicMock()
+        mock_state.load_circuit_breaker.return_value = (0.0, False, 0.0)
+        mock_state.load_positions.return_value = {}
+        guard = RiskGuard(client, state_store=mock_state)
         
         # Verify initial HWM is dynamic 0.0
         self.assertEqual(guard.portfolio_high_watermark, 0.0)
@@ -201,6 +205,45 @@ class TestRiskGuard(unittest.TestCase):
 
         is_wick_anomaly = ask_price < pos.effective_stop_price and curr_price >= pos.effective_stop_price
         self.assertTrue(is_wick_anomaly)
+
+    def test_audit_and_protect_long_toxicity_attribute_safety(self):
+        """
+        Validates that audit_and_protect executes cleanly on active LONG positions
+        without throwing AttributeError on TOXICITY_IMBALANCE_THRESHOLD, and correctly
+        audits the position.
+        """
+        from unittest.mock import MagicMock
+        from bot.data.market_feed import MarketSnapshot, AssetMetrics
+        client = MagicMock()
+        client.get_balance.return_value = {
+            'Success': True,
+            'SpotWallet': {'USD': {'Free': 50000.0, 'Locked': 0.0}, 'SOL': {'Free': 10.0, 'Locked': 0.0}},
+            'Wallet': {'USD': {'Free': 50000.0, 'Locked': 0.0}, 'SOL': {'Free': 10.0, 'Locked': 0.0}}
+        }
+        client.get_ticker.return_value = {'Success': True, 'Data': {'SOL/USD': {'LastPrice': 100.0, 'BidPrice': 99.9, 'AskPrice': 100.1}}}
+        client.get_short_positions.return_value = {'Success': True, 'Positions': []}
+
+        mock_state = MagicMock()
+        mock_state.load_circuit_breaker.return_value = (0.0, False, 0.0)
+        mock_state.load_positions.return_value = {}
+        guard = RiskGuard(roostoo_client=client, state_store=mock_state)
+
+        metric = AssetMetrics(
+            symbol='SOLUSDT', roostoo_pair='SOL/USD', last_price=100.0, spread_pct=0.01,
+            volume_24h_usd=50000000.0, return_12h_pct=2.0, return_4h_pct=1.0, return_15m_pct=0.20,
+            taker_buy_4h_pct=52.0, taker_imbalance_15m=-0.35, vol_zscore_15m=3.0, atr_15m_pct=0.8,
+            beta_to_btc=1.0, residual_alpha_pct=0.5, is_liquid=True
+        )
+
+        snapshot = MarketSnapshot(
+            timestamp=1000000.0, btc_above_ema20=True, btc_taker_buy_pct=52.0, btc_atr_normal=True,
+            assets={'SOLUSDT': metric}, exchange_info={'SOL/USD': {'AmountPrecision': 2, 'MiniOrder': 1.0}}
+        )
+
+        # Must execute without any AttributeError
+        res = guard.audit_and_protect(snapshot)
+        self.assertEqual(res.get("Status"), "OK")
+        self.assertEqual(res.get("ActivePositions"), 1)
 
 if __name__ == "__main__":
     unittest.main()

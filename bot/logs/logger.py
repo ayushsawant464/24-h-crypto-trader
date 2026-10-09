@@ -50,7 +50,7 @@ def log_trade(
     
     # Write to JSONL
     with open(TRACE_FILE, "a") as f:
-        f.write(json.dumps(record) + "\n")
+        f.write(json.dumps(record, default=str) + "\n")
         
     logger.info(
         f"[TRADE EXECUTED] {side.upper()} {quantity} {symbol} @ {price} | "

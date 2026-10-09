@@ -20,6 +20,7 @@ class DecisionEngine(BaseStrategy):
                 self.state_store = None
         else:
             self.state_store = state_store
+        self.current_regime: Optional[str] = None
 
     def calculate_expected_value(self, metric: AssetMetrics) -> float:
         """
@@ -99,13 +100,32 @@ class DecisionEngine(BaseStrategy):
 
         market_health_score = score_trend + score_momentum + score_orderflow + score_volatility
 
-        # Smooth Continuous Regime Transition (Eliminates Boolean Cliff Edges)
-        if market_health_score < settings.REGIME_BEAR_SCORE_THRESHOLD:
-            regime = "BEAR_CONTRACTION"
-        elif market_health_score > settings.REGIME_BULL_SCORE_THRESHOLD:
-            regime = "BULL_EXPANSION"
-        else:
-            regime = "SIDEWAYS_STABILITY"
+        # Continuous Regime Transition with Hysteresis (Eliminates whipsaw at boundary)
+        prev_regime = self.current_regime
+        bear_enter = getattr(settings, "REGIME_BEAR_ENTER_THRESHOLD", 35.0)
+        bear_exit = getattr(settings, "REGIME_BEAR_EXIT_THRESHOLD", 42.0)
+        bull_enter = getattr(settings, "REGIME_BULL_ENTER_THRESHOLD", 66.0)
+        bull_exit = getattr(settings, "REGIME_BULL_EXIT_THRESHOLD", 60.0)
+
+        if prev_regime == "BEAR_CONTRACTION":
+            if market_health_score > bear_exit:
+                regime = "BULL_EXPANSION" if market_health_score > bull_enter else "SIDEWAYS_STABILITY"
+            else:
+                regime = "BEAR_CONTRACTION"
+        elif prev_regime == "BULL_EXPANSION":
+            if market_health_score < bull_exit:
+                regime = "BEAR_CONTRACTION" if market_health_score < bear_enter else "SIDEWAYS_STABILITY"
+            else:
+                regime = "BULL_EXPANSION"
+        else: # Initial or previous was SIDEWAYS_STABILITY
+            if market_health_score < bear_enter:
+                regime = "BEAR_CONTRACTION"
+            elif market_health_score > bull_enter:
+                regime = "BULL_EXPANSION"
+            else:
+                regime = "SIDEWAYS_STABILITY"
+
+        self.current_regime = regime
 
         logger.info(
             f"[REGIME CLASSIFIER] Classified Market as: {regime} | HealthScore: {market_health_score:.1f}/100 | "

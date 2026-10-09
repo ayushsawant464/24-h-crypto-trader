@@ -368,5 +368,32 @@ class TestDecisionEngine(unittest.TestCase):
         self.assertGreaterEqual(decision.target_weights["USD"], 0.30)
         self.assertIn("Elevated Cash Buffer", decision.rationales["USD"])
 
+    def test_regime_hysteresis_prevents_whipsaw(self):
+        """
+        Validates that when the market health score oscillates around 37.0 - 39.0,
+        regime hysteresis prevents rapid flipping between SIDEWAYS and BEAR.
+        """
+        engine = DecisionEngine()
+        engine.current_regime = "SIDEWAYS_STABILITY"
+
+        # Create snapshot where health score is ~37.0 (below 38.0, but above bear_enter 35.0)
+        # score_trend = 5.0 (below EMA20)
+        # score_momentum = 15.0 (0.0% ret)
+        # score_orderflow = 15.0 (50.0% taker buy)
+        # score_volatility = 0.0 (atr not normal)
+        # Total = 35.0
+        snapshot = MarketSnapshot(
+            timestamp=1000000.0,
+            btc_above_ema20=False,
+            btc_taker_buy_pct=51.0,
+            btc_atr_normal=False,
+            assets={},
+            exchange_info={}
+        )
+
+        decision = engine.evaluate(snapshot, portfolio_state={})
+        # Because previous regime was SIDEWAYS and score > 35.0, it remains in SIDEWAYS_STABILITY
+        self.assertEqual(decision.regime, "SIDEWAYS_STABILITY")
+
 if __name__ == "__main__":
     unittest.main()

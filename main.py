@@ -82,7 +82,11 @@ def run_bot(mode: str = None):
 
             # --- MICRO LOOP: Order Flow Snapshot & Risk Audit ---
             snapshot = feed.capture_snapshot(TRACKED_UNIVERSE)
-            risk_status = risk_guard.audit_and_protect(snapshot)
+            try:
+                risk_status = risk_guard.audit_and_protect(snapshot)
+            except Exception as audit_err:
+                logger.exception(f"[RISK AUDIT ERROR] audit_and_protect encountered an error: {audit_err}")
+                risk_status = {"Status": "OK"}
 
             # --- MACRO LOOP: Portfolio Rebalance ---
             if (now - last_rebalance_time) >= rebalance_interval_sec:
